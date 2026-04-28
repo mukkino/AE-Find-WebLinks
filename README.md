@@ -1,10 +1,26 @@
 # Find-WebLinks
 
+**Version 1.1**
+
 Find-WebLinks is a PowerShell script that extracts web links from a single web page or from a text file containing multiple URLs.
 
 It is useful when you need to scan pages, collect matching links, process long URL lists, or keep a simple audit trail of what was found, skipped, or failed.
 
 The script does not require a browser, browser driver, Selenium, Playwright, or external PowerShell modules. It uses PowerShell’s built-in `Invoke-WebRequest`.
+
+## What changed in version 1.1
+
+Version 1.1 improves how supporting files are handled during longer runs.
+
+New and improved behaviour:
+
+- `LogCsv` now has its own independent mode through `-LogMode`
+- `FailedUrlFile` now has its own independent mode through `-FailedUrlMode`
+- The main output file, CSV log file, and failed URL file can now be set to `Append` or `New` independently
+- Empty CSV log files automatically receive the correct CSV header
+- Empty failed URL files automatically receive the correct tab-separated header
+- File-collision checks were improved to avoid accidentally overwriting source, output, blacklist, log, or failed URL files
+- The final summary now shows the CSV log mode and failed URL file mode when those files are used
 
 ## What it does
 
@@ -12,13 +28,14 @@ The script does not require a browser, browser driver, Selenium, Playwright, or 
 - Extracts links from HTML, scripts, JSON-like text, CSS references, and noscript blocks
 - Filters links using wildcard patterns such as `*news*` or `*download*`
 - Writes matching links to a text file
-- Supports append or overwrite mode
+- Supports append or overwrite mode for the main output file
 - Retries failed requests
 - Can fetch the same URL twice and keep the larger response
 - Removes duplicates by default
 - Supports exact URL blacklist files
 - Can write a CSV log of each processed URL
 - Can save failed URLs to a separate file
+- Supports independent append/new modes for the CSV log and failed URL file
 - Writes results after each page, so long runs keep partial progress
 
 ## How to use it
@@ -196,6 +213,12 @@ Failed URLs will be saved into:
 failed.txt
 ```
 
+The failed URL file is tab-separated and contains:
+
+```text
+SourceUrl	Error
+```
+
 ### Create a CSV log
 
 A CSV log is useful if you want a report showing what happened for each page.
@@ -273,6 +296,80 @@ Use Url when scanning one page
 Use File when scanning a list of pages
 ```
 
+## Main output, CSV log, and failed URL modes
+
+From version 1.1, the main output file, CSV log file, and failed URL file can each have their own mode.
+
+This means you can decide independently whether each file should be overwritten or appended.
+
+```text
+Mode           controls the main output file
+LogMode        controls the CSV log file
+FailedUrlMode  controls the failed URL file
+```
+
+Defaults:
+
+```text
+Mode           Append
+LogMode        Append
+FailedUrlMode  Append
+```
+
+### Example: append output, but create fresh log files
+
+```powershell
+.\Find-WebLinks.ps1 "urls.txt" "*news*" "matched.txt" Append File -LogCsv "run-log.csv" -LogMode New -FailedUrlFile "failed.txt" -FailedUrlMode New
+```
+
+This means:
+
+```text
+matched.txt   append new matched links
+run-log.csv   create fresh CSV log
+failed.txt    create fresh failed URL file
+```
+
+### Example: create fresh output, but append to existing logs
+
+```powershell
+.\Find-WebLinks.ps1 "urls.txt" "*news*" "matched.txt" New File -LogCsv "run-log.csv" -LogMode Append -FailedUrlFile "failed.txt" -FailedUrlMode Append
+```
+
+This means:
+
+```text
+matched.txt   overwrite/create fresh matched links file
+run-log.csv   append new log rows
+failed.txt    append new failed URLs
+```
+
+### Example: everything fresh
+
+```powershell
+.\Find-WebLinks.ps1 "urls.txt" "*news*" "matched.txt" New File -LogCsv "run-log.csv" -LogMode New -FailedUrlFile "failed.txt" -FailedUrlMode New
+```
+
+### Example: everything appended
+
+```powershell
+.\Find-WebLinks.ps1 "urls.txt" "*news*" "matched.txt" Append File -LogCsv "run-log.csv" -LogMode Append -FailedUrlFile "failed.txt" -FailedUrlMode Append
+```
+
+### Headers in log files
+
+If the CSV log file exists but is empty, the script adds this header automatically:
+
+```csv
+Timestamp,SourceUrl,Status,Extracted,Matched,Blacklisted,Duplicates,Written,Error
+```
+
+If the failed URL file exists but is empty, the script adds this header automatically:
+
+```text
+SourceUrl	Error
+```
+
 ## Useful options
 
 ### Retry slower websites
@@ -346,6 +443,24 @@ It does not automatically block:
 ```text
 https://example.com/unwanted-page/other
 ```
+
+## Options reference
+
+| Option | Default | Description |
+|---|---:|---|
+| `-RetryCount` | `3` | Number of retry attempts per URL |
+| `-WaitSeconds` | `30` | Seconds to wait between retries of the same URL |
+| `-TimeoutSeconds` | `120` | HTTP timeout per request attempt |
+| `-DelaySeconds` | `5` | Seconds to wait between different URLs in `File` mode |
+| `-SecondFetch` | `$true` | Fetch each URL twice and keep the larger response |
+| `-SecondFetchWait` | `5` | Seconds to wait before the second fetch |
+| `-KeepDuplicates` | off | Keeps repeated matches found within the same page |
+| `-NoDuplicates` | `$true` | Skips links already written or already present in the output file |
+| `-BlacklistFile` | none | One or more files containing exact URLs to exclude |
+| `-LogCsv` | none | CSV file with per-URL processing statistics |
+| `-FailedUrlFile` | none | Tab-separated file containing failed source URLs and errors |
+| `-LogMode` | `Append` | Append to or overwrite the CSV log file |
+| `-FailedUrlMode` | `Append` | Append to or overwrite the failed URL file |
 
 ## Output files
 
