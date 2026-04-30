@@ -1,6 +1,6 @@
 #requires -Version 5.1
 
-# Find-WebLinks.ps1 - 1.5.0
+# Find-WebLinks.ps1 - 1.6.0
 # Author: Fabio Lichinchi (mukka)
 # 
 # THE UNLICENSE
@@ -242,7 +242,15 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 100)]
-    [double]$HighFailureRatePercent = 50
+    [double]$HighFailureRatePercent = 50,
+
+    [Parameter(Mandatory = $false)]
+    [Alias("h")]
+    [switch]$Help,
+
+    [Parameter(Mandatory = $false)]
+    [Alias("Interactive")]
+    [switch]$InteractiveHelp
 )
 
 Set-StrictMode -Version Latest
@@ -335,6 +343,10 @@ else {
 function Show-Usage {
     Write-Host ""
     Write-Host "Usage:"
+    Write-Host "  Help and command builder:"
+    Write-Host "  .\Find-WebLinks.ps1 -Help"
+    Write-Host "  .\Find-WebLinks.ps1 -InteractiveHelp"
+    Write-Host ""
     Write-Host "  Run / scrape mode:"
     Write-Host "  .\Find-WebLinks.ps1 <Source> <SearchPattern> <OutputFile> [Mode] [SourceType] [options]"
     Write-Host "  .\Find-WebLinks.ps1 <Source> -SearchPatterns <patterns> -OutputFile <OutputFile> [options]"
@@ -374,6 +386,8 @@ function Show-Usage {
     Write-Host "            them. Results are written to the output file after each page."
     Write-Host ""
     Write-Host "Options:"
+    Write-Host "  -Help                     Show this help and exit"
+    Write-Host "  -InteractiveHelp          Start the guided command builder and exit"
     Write-Host "  -RetryCount <n>            Number of retry attempts per URL (default: 3)"
     Write-Host "  -WaitSeconds <n>           Seconds to wait between retries of the same URL (default: 30)"
     Write-Host "  -TimeoutSeconds <n>        HTTP timeout per request attempt (default: 120)"
@@ -516,6 +530,761 @@ function Show-Usage {
     Write-Host "  Vue, Angular SPAs, etc.) will not be visible. It does extract URLs"
     Write-Host "  embedded in <script> blocks, JSON, CSS, and <noscript> fallbacks."
     Write-Host ""
+}
+function Format-PowerShellStringLiteral {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return "''" }
+
+    $text = [string]$Value
+    return "'" + $text.Replace("'", "''") + "'"
+}
+
+function Format-PowerShellArrayLiteral {
+    param([AllowNull()][object[]]$Values)
+
+    if ($null -eq $Values -or $Values.Count -eq 0) { return "@()" }
+
+    $items = New-Object System.Collections.Generic.List[string]
+    foreach ($value in $Values) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
+            [void]$items.Add((Format-PowerShellStringLiteral $value))
+        }
+    }
+
+    if ($items.Count -eq 0) { return "@()" }
+    return ($items -join ",")
+}
+
+function Add-CommandValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]]$Parts,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [AllowNull()]
+        [object]$Value,
+
+        [switch]$Always
+    )
+
+    if (-not $Always) {
+        if ($null -eq $Value) { return }
+        if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value)) { return }
+        if ($Value -is [array] -and $Value.Count -eq 0) { return }
+    }
+
+    [void]$Parts.Add("-$Name")
+
+    if ($Value -is [array]) {
+        [void]$Parts.Add((Format-PowerShellArrayLiteral ([object[]]$Value)))
+    }
+    else {
+        [void]$Parts.Add((Format-PowerShellStringLiteral $Value))
+    }
+}
+
+function Add-CommandIntValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]]$Parts,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return }
+    [void]$Parts.Add("-$Name")
+    [void]$Parts.Add(([string]$Value))
+}
+
+function Add-CommandBoolValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]]$Parts,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return }
+    $boolText = if ([bool]$Value) { "true" } else { "false" }
+    [void]$Parts.Add("-${Name}:`$$boolText")
+}
+
+function Add-CommandSwitch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[string]]$Parts,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [AllowNull()]
+        [object]$Enabled
+    )
+
+    if ($null -ne $Enabled -and [bool]$Enabled) {
+        [void]$Parts.Add("-$Name")
+    }
+}
+
+function Read-InteractiveText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [string]$Default = $null,
+
+        [switch]$Required
+    )
+
+    while ($true) {
+        $displayPrompt = $Prompt
+        if (-not [string]::IsNullOrWhiteSpace($Default)) {
+            $displayPrompt = "$Prompt [$Default]"
+        }
+
+        $value = Read-Host $displayPrompt
+
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            if (-not [string]::IsNullOrWhiteSpace($Default)) {
+                return $Default
+            }
+
+            if ($Required) {
+                Write-Host "This value is required." -ForegroundColor Yellow
+                continue
+            }
+
+            return $null
+        }
+
+        return $value.Trim()
+    }
+}
+
+function Read-InteractiveInt {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [AllowNull()]
+        [object]$Default = $null,
+
+        [int]$Minimum = 0,
+
+        [int]$Maximum = 2147483647
+    )
+
+    while ($true) {
+        $displayPrompt = $Prompt
+        if ($null -ne $Default) {
+            $displayPrompt = "$Prompt [$Default]"
+        }
+
+        $raw = Read-Host $displayPrompt
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+
+        $parsed = 0
+        if ([int]::TryParse($raw.Trim(), [ref]$parsed) -and $parsed -ge $Minimum -and $parsed -le $Maximum) {
+            return $parsed
+        }
+
+        Write-Host "Enter a whole number between $Minimum and $Maximum." -ForegroundColor Yellow
+    }
+}
+
+function Read-InteractiveYesNo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [bool]$Default = $false
+    )
+
+    $suffix = if ($Default) { "[Y/n]" } else { "[y/N]" }
+
+    while ($true) {
+        $raw = Read-Host "$Prompt $suffix"
+
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+
+        switch -Regex ($raw.Trim()) {
+            '^(y|yes)$' { return $true }
+            '^(n|no)$'  { return $false }
+            default     { Write-Host "Please answer yes or no." -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Read-InteractiveChoice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Choices,
+
+        [int]$DefaultIndex = 0
+    )
+
+    if ($Choices.Count -eq 0) { throw "Read-InteractiveChoice requires at least one choice." }
+
+    while ($true) {
+        Write-Host ""
+        Write-Host $Prompt
+        for ($i = 0; $i -lt $Choices.Count; $i++) {
+            $number = $i + 1
+            $defaultMarker = if ($i -eq $DefaultIndex) { " [default]" } else { "" }
+            Write-Host "  $number) $($Choices[$i])$defaultMarker"
+        }
+
+        $raw = Read-Host "Select an option"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Choices[$DefaultIndex]
+        }
+
+        $selectedNumber = 0
+        if ([int]::TryParse($raw.Trim(), [ref]$selectedNumber)) {
+            if ($selectedNumber -ge 1 -and $selectedNumber -le $Choices.Count) {
+                return $Choices[$selectedNumber - 1]
+            }
+        }
+
+        foreach ($choice in $Choices) {
+            if ($choice.Equals($raw.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $choice
+            }
+        }
+
+        Write-Host "Invalid choice." -ForegroundColor Yellow
+    }
+}
+
+function Convert-InteractiveList {
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+
+    return @(
+        $Text -split ',' |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function Set-OptionalTextValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [string]$Default = $null
+    )
+
+    $value = Read-InteractiveText -Prompt $Prompt -Default $Default
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+        $Settings[$Name] = $value
+    }
+}
+
+function Set-OptionalIntValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [AllowNull()]
+        [object]$Default = $null,
+
+        [int]$Minimum = 0,
+
+        [int]$Maximum = 2147483647
+    )
+
+    $value = Read-InteractiveInt -Prompt $Prompt -Default $Default -Minimum $Minimum -Maximum $Maximum
+    if ($null -ne $value) {
+        $Settings[$Name] = $value
+    }
+}
+
+function Set-OptionalChoiceValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Choices,
+
+        [int]$DefaultIndex = 0
+    )
+
+    $value = Read-InteractiveChoice -Prompt $Prompt -Choices $Choices -DefaultIndex $DefaultIndex
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+        $Settings[$Name] = $value
+    }
+}
+
+function Set-OptionalBoolValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [bool]$Default = $false
+    )
+
+    $Settings[$Name] = (Read-InteractiveYesNo -Prompt $Prompt -Default $Default)
+}
+
+function Set-OptionalSwitchValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt,
+
+        [bool]$Default = $false
+    )
+
+    $Settings[$Name] = (Read-InteractiveYesNo -Prompt $Prompt -Default $Default)
+}
+
+function Edit-RunOptionalSettings {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceType
+    )
+
+    while ($true) {
+        $section = Read-InteractiveChoice `
+            -Prompt "Optional settings. Pick a section, or finish." `
+            -Choices @(
+                "Finish and generate command",
+                "Resume, blacklist, logging, and files",
+                "Retry, network, proxy, and fetching",
+                "Duplicates, sorting, and maintenance",
+                "Limits, performance, and safety guardrails"
+            ) `
+            -DefaultIndex 0
+
+        switch ($section) {
+            "Finish and generate command" { return }
+
+            "Resume, blacklist, logging, and files" {
+                if ($SourceType -eq "File") {
+                    Set-OptionalSwitchValue -Settings $Settings -Name "Resume" -Prompt "Is this a resume run from an existing progress file?" -Default $false
+                    Set-OptionalTextValue -Settings $Settings -Name "ProgressFile" -Prompt "Custom progress file path? Leave blank for <OutputFile>.progress"
+                }
+
+                $blacklistText = Read-InteractiveText -Prompt "Blacklist file(s), comma-separated? Leave blank for none"
+                $blacklist = @(Convert-InteractiveList $blacklistText)
+                if ($blacklist.Count -gt 0) {
+                    $Settings["BlacklistFile"] = $blacklist
+                    Set-OptionalChoiceValue -Settings $Settings -Name "BlacklistScope" -Prompt "Where should the blacklist apply?" -Choices @("Both", "Input", "Output") -DefaultIndex 0
+                }
+
+                Set-OptionalTextValue -Settings $Settings -Name "LogCsv" -Prompt "CSV log file path? Leave blank for none"
+                if ($Settings.ContainsKey("LogCsv")) {
+                    Set-OptionalChoiceValue -Settings $Settings -Name "LogMode" -Prompt "CSV log mode?" -Choices @("Append", "New") -DefaultIndex 0
+                }
+
+                Set-OptionalTextValue -Settings $Settings -Name "FailedUrlFile" -Prompt "Failed URL file path? Leave blank for none"
+                if ($Settings.ContainsKey("FailedUrlFile")) {
+                    Set-OptionalChoiceValue -Settings $Settings -Name "FailedUrlMode" -Prompt "Failed URL file mode?" -Choices @("Append", "New") -DefaultIndex 0
+                }
+
+                Set-OptionalSwitchValue -Settings $Settings -Name "KeepFragments" -Prompt "Keep URL fragments (#...) when deduplicating?" -Default $false
+            }
+
+            "Retry, network, proxy, and fetching" {
+                Set-OptionalIntValue -Settings $Settings -Name "RetryCount" -Prompt "Retry attempts per URL" -Default 3 -Minimum 1
+                Set-OptionalIntValue -Settings $Settings -Name "WaitSeconds" -Prompt "Seconds between retries" -Default 30
+                Set-OptionalIntValue -Settings $Settings -Name "TimeoutSeconds" -Prompt "HTTP timeout per attempt, seconds" -Default 120 -Minimum 1
+                if ($SourceType -eq "File") {
+                    Set-OptionalIntValue -Settings $Settings -Name "DelaySeconds" -Prompt "Seconds between different source URLs" -Default 5
+                    Set-OptionalIntValue -Settings $Settings -Name "ThrottleLimit" -Prompt "Parallel source URLs. 1 = sequential. PS 7+ required above 1" -Default 1 -Minimum 1
+                }
+                Set-OptionalBoolValue -Settings $Settings -Name "SecondFetch" -Prompt "Fetch each URL twice and keep the larger response?" -Default $true
+                if ($Settings.ContainsKey("SecondFetch") -and [bool]$Settings["SecondFetch"]) {
+                    Set-OptionalIntValue -Settings $Settings -Name "SecondFetchWait" -Prompt "Seconds before the second fetch" -Default 5
+                }
+                Set-OptionalTextValue -Settings $Settings -Name "Proxy" -Prompt "Proxy URL? Example: http://proxy:8080. Leave blank for none"
+                Set-OptionalTextValue -Settings $Settings -Name "UserAgent" -Prompt "Custom User-Agent? Leave blank for default"
+                Set-OptionalIntValue -Settings $Settings -Name "MaxRedirects" -Prompt "Maximum HTTP/meta-refresh redirects" -Default 10 -Minimum 1
+                Set-OptionalIntValue -Settings $Settings -Name "MaxRetryAfterSeconds" -Prompt "Maximum server Retry-After seconds to honour. 0 = ignore" -Default 300
+                Set-OptionalIntValue -Settings $Settings -Name "ConnectionLimit" -Prompt ".NET HTTP connection limit" -Default 100 -Minimum 1
+            }
+
+            "Duplicates, sorting, and maintenance" {
+                Set-OptionalBoolValue -Settings $Settings -Name "NoDuplicates" -Prompt "Skip links already written or already present in the output file?" -Default $true
+                Set-OptionalSwitchValue -Settings $Settings -Name "KeepDuplicates" -Prompt "Keep repeated matches found inside the same page?" -Default $false
+                Set-OptionalChoiceValue -Settings $Settings -Name "DeduplicateWhen" -Prompt "Deduplicate involved files when?" -Choices @("None", "Start", "End", "Both") -DefaultIndex 0
+                Set-OptionalChoiceValue -Settings $Settings -Name "SortWhen" -Prompt "Sort involved files when?" -Choices @("None", "Start", "End", "Both") -DefaultIndex 0
+                if ($Settings.ContainsKey("SortWhen") -and $Settings["SortWhen"] -ne "None") {
+                    Set-OptionalChoiceValue -Settings $Settings -Name "SortDirection" -Prompt "Sort direction?" -Choices @("Ascending", "Descending") -DefaultIndex 0
+                }
+                Set-OptionalSwitchValue -Settings $Settings -Name "DeduplicateFiles" -Prompt "Use legacy -DeduplicateFiles switch before starting? Usually leave this off." -Default $false
+                Set-OptionalBoolValue -Settings $Settings -Name "SortOutput" -Prompt "Use legacy -SortOutput after the run? Usually prefer -SortWhen End." -Default $false
+            }
+
+            "Limits, performance, and safety guardrails" {
+                Set-OptionalIntValue -Settings $Settings -Name "MaintenanceLargeFileLimitMB" -Prompt "Max MB for in-memory dedup/sort. 0 = no limit" -Default 1024
+                Set-OptionalSwitchValue -Settings $Settings -Name "IgnoreMaintenanceLargeFileLimit" -Prompt "Ignore the maintenance large-file limit?" -Default $false
+                Set-OptionalIntValue -Settings $Settings -Name "MaxPageContentMB" -Prompt "Max page body size to parse, MB. 0 = no limit" -Default 50
+                Set-OptionalIntValue -Settings $Settings -Name "RegexTimeoutSeconds" -Prompt "Regex timeout seconds. 0 = no timeout" -Default 10
+                Set-OptionalIntValue -Settings $Settings -Name "MaxUrlLength" -Prompt "Max URL/key length before truncation. 0 = no limit" -Default 8192
+                Set-OptionalIntValue -Settings $Settings -Name "FileWriteRetryCount" -Prompt "Output/log/progress append retry attempts" -Default 5 -Minimum 1
+                Set-OptionalIntValue -Settings $Settings -Name "FileWriteRetryDelayMinMs" -Prompt "Minimum append retry delay, ms" -Default 50
+                Set-OptionalIntValue -Settings $Settings -Name "FileWriteRetryDelayMaxMs" -Prompt "Maximum append retry delay, ms" -Default 300
+                Set-OptionalIntValue -Settings $Settings -Name "FileMoveRetryCount" -Prompt "Dedup/sort replace retry attempts" -Default 5 -Minimum 1
+                Set-OptionalIntValue -Settings $Settings -Name "FileMoveRetryDelayMs" -Prompt "Delay between dedup/sort replace retries, ms" -Default 300
+                Set-OptionalIntValue -Settings $Settings -Name "HighFailureRatePercent" -Prompt "Warn when File-mode failures reach this percent. 0 = disable" -Default 50 -Minimum 0 -Maximum 100
+                Set-OptionalSwitchValue -Settings $Settings -Name "AllowExtremeOperationalValues" -Prompt "Allow values above normal typo guardrails?" -Default $false
+            }
+        }
+    }
+}
+
+function New-RunCommandFromInteractiveAnswers {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$SearchPatternsValue,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SearchModeValue,
+
+        [AllowNull()]
+        [string[]]$ExcludePatternsValue,
+
+        [AllowNull()]
+        [string]$ExcludeModeValue,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFileValue,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ModeValue,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceTypeValue,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings
+    )
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    [void]$parts.Add(".\Find-WebLinks.ps1")
+
+    Add-CommandValue -Parts $parts -Name "Source" -Value $Source -Always
+
+    if ($SearchPatternsValue.Count -eq 1) {
+        Add-CommandValue -Parts $parts -Name "SearchPattern" -Value $SearchPatternsValue[0] -Always
+    }
+    else {
+        Add-CommandValue -Parts $parts -Name "SearchPatterns" -Value $SearchPatternsValue -Always
+    }
+
+    if ($SearchPatternsValue.Count -gt 1 -or $SearchModeValue -ne "Any") {
+        Add-CommandValue -Parts $parts -Name "SearchMode" -Value $SearchModeValue
+    }
+
+    if ($ExcludePatternsValue -and $ExcludePatternsValue.Count -gt 0) {
+        if ($ExcludePatternsValue.Count -eq 1) {
+            Add-CommandValue -Parts $parts -Name "ExcludePattern" -Value $ExcludePatternsValue[0]
+        }
+        else {
+            Add-CommandValue -Parts $parts -Name "ExcludePatterns" -Value $ExcludePatternsValue
+        }
+        Add-CommandValue -Parts $parts -Name "ExcludeMode" -Value $ExcludeModeValue
+    }
+
+    Add-CommandValue -Parts $parts -Name "OutputFile" -Value $OutputFileValue -Always
+    Add-CommandValue -Parts $parts -Name "Mode" -Value $ModeValue -Always
+    Add-CommandValue -Parts $parts -Name "SourceType" -Value $SourceTypeValue -Always
+
+    foreach ($name in @(
+        "BlacklistScope", "LogMode", "FailedUrlMode", "SortDirection", "DeduplicateWhen", "SortWhen",
+        "Proxy", "UserAgent", "ProgressFile", "LogCsv", "FailedUrlFile"
+    )) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandValue -Parts $parts -Name $name -Value $Settings[$name]
+        }
+    }
+
+    foreach ($name in @("BlacklistFile")) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandValue -Parts $parts -Name $name -Value $Settings[$name]
+        }
+    }
+
+    foreach ($name in @(
+        "RetryCount", "WaitSeconds", "TimeoutSeconds", "DelaySeconds", "SecondFetchWait", "ThrottleLimit",
+        "MaxRedirects", "MaxRetryAfterSeconds", "ConnectionLimit", "MaintenanceLargeFileLimitMB",
+        "MaxPageContentMB", "RegexTimeoutSeconds", "MaxUrlLength", "FileWriteRetryCount",
+        "FileWriteRetryDelayMinMs", "FileWriteRetryDelayMaxMs", "FileMoveRetryCount", "FileMoveRetryDelayMs",
+        "HighFailureRatePercent"
+    )) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandIntValue -Parts $parts -Name $name -Value $Settings[$name]
+        }
+    }
+
+    foreach ($name in @("SecondFetch", "NoDuplicates", "SortOutput")) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandBoolValue -Parts $parts -Name $name -Value $Settings[$name]
+        }
+    }
+
+    foreach ($name in @(
+        "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments",
+        "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues"
+    )) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandSwitch -Parts $parts -Name $name -Enabled $Settings[$name]
+        }
+    }
+
+    return ($parts -join " ")
+}
+
+function Start-InteractiveRunCommandBuilder {
+    Write-Host ""
+    Write-Host "Interactive run command builder"
+    Write-Host "This will only build a command string. It will not fetch URLs or write files."
+
+    $sourceTypeChoice = Read-InteractiveChoice -Prompt "What do you want to process?" -Choices @("One web page URL", "A text file containing many source URLs") -DefaultIndex 1
+    $sourceTypeValue = if ($sourceTypeChoice -eq "One web page URL") { "Url" } else { "File" }
+
+    $sourcePrompt = if ($sourceTypeValue -eq "Url") { "Source URL" } else { "Source text file containing URLs" }
+    $sourceValue = Read-InteractiveText -Prompt $sourcePrompt -Required
+
+    $patternText = Read-InteractiveText -Prompt "Search pattern(s), comma-separated. Use wildcards like *zip* or press Enter for all links" -Default "*"
+    $searchPatternsValue = @(Convert-InteractiveList $patternText)
+    if ($searchPatternsValue.Count -eq 0) { $searchPatternsValue = @("*") }
+
+    $searchModeValue = "Any"
+    if ($searchPatternsValue.Count -gt 1) {
+        $searchModeValue = Read-InteractiveChoice -Prompt "How should multiple search patterns match?" -Choices @("Any", "All") -DefaultIndex 0
+    }
+
+    $excludePatternsValue = @()
+    $excludeModeValue = "Any"
+    if (Read-InteractiveYesNo -Prompt "Do you want to exclude matching links with wildcard patterns?" -Default $false) {
+        $excludeText = Read-InteractiveText -Prompt "Exclude pattern(s), comma-separated. Example: *demo*,*trailer*" -Required
+        $excludePatternsValue = @(Convert-InteractiveList $excludeText)
+        if ($excludePatternsValue.Count -gt 1) {
+            $excludeModeValue = Read-InteractiveChoice -Prompt "How should multiple exclude patterns work?" -Choices @("Any", "All") -DefaultIndex 0
+        }
+    }
+
+    $outputFileValue = Read-InteractiveText -Prompt "Output file for matched links" -Default ".\matched-links.txt" -Required
+    $modeValue = Read-InteractiveChoice -Prompt "Output mode?" -Choices @("Append", "New") -DefaultIndex 0
+
+    $settings = @{}
+
+    if (Read-InteractiveYesNo -Prompt "Do you want to review optional settings?" -Default $false) {
+        Edit-RunOptionalSettings -Settings $settings -SourceType $sourceTypeValue
+    }
+
+    $commandLine = New-RunCommandFromInteractiveAnswers `
+        -Source $sourceValue `
+        -SearchPatternsValue $searchPatternsValue `
+        -SearchModeValue $searchModeValue `
+        -ExcludePatternsValue $excludePatternsValue `
+        -ExcludeModeValue $excludeModeValue `
+        -OutputFileValue $outputFileValue `
+        -ModeValue $modeValue `
+        -SourceTypeValue $sourceTypeValue `
+        -Settings $settings
+
+    Write-Host ""
+    Write-Host "Generated command:" -ForegroundColor Green
+    Write-Host ""
+    Write-Host $commandLine -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Nothing was executed. Copy and run the command above when ready."
+}
+
+function New-MaintenanceCommandFromInteractiveAnswers {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CommandValue,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$FilesValue,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Settings
+    )
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    [void]$parts.Add(".\Find-WebLinks.ps1")
+
+    Add-CommandValue -Parts $parts -Name "Command" -Value $CommandValue -Always
+    Add-CommandValue -Parts $parts -Name "Files" -Value $FilesValue -Always
+
+    foreach ($name in @("SortDirection", "DeduplicateWhen", "SortWhen")) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandValue -Parts $parts -Name $name -Value $Settings[$name]
+        }
+    }
+
+    foreach ($name in @(
+        "MaintenanceLargeFileLimitMB", "FileMoveRetryCount", "FileMoveRetryDelayMs",
+        "FileWriteRetryCount", "FileWriteRetryDelayMinMs", "FileWriteRetryDelayMaxMs"
+    )) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandIntValue -Parts $parts -Name $name -Value $Settings[$name]
+        }
+    }
+
+    foreach ($name in @("IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues")) {
+        if ($Settings.ContainsKey($name)) {
+            Add-CommandSwitch -Parts $parts -Name $name -Enabled $Settings[$name]
+        }
+    }
+
+    return ($parts -join " ")
+}
+
+function Start-InteractiveMaintenanceCommandBuilder {
+    Write-Host ""
+    Write-Host "Interactive maintenance command builder"
+    Write-Host "This will only build a command string. It will not modify files."
+
+    $commandValue = Read-InteractiveChoice -Prompt "What maintenance command do you want?" -Choices @("Deduplicate", "Sort", "Maintain") -DefaultIndex 0
+
+    $filesText = Read-InteractiveText -Prompt "File(s) to maintain, comma-separated" -Required
+    $filesValue = @(Convert-InteractiveList $filesText)
+    while ($filesValue.Count -eq 0) {
+        Write-Host "At least one file is required." -ForegroundColor Yellow
+        $filesText = Read-InteractiveText -Prompt "File(s) to maintain, comma-separated" -Required
+        $filesValue = @(Convert-InteractiveList $filesText)
+    }
+
+    $settings = @{}
+
+    if ($commandValue -eq "Sort") {
+        Set-OptionalChoiceValue -Settings $settings -Name "SortDirection" -Prompt "Sort direction?" -Choices @("Ascending", "Descending") -DefaultIndex 0
+    }
+    elseif ($commandValue -eq "Maintain") {
+        Set-OptionalChoiceValue -Settings $settings -Name "DeduplicateWhen" -Prompt "Deduplicate when? In standalone maintenance, Start/End/Both collapse to one pass." -Choices @("None", "Start", "End", "Both") -DefaultIndex 1
+        Set-OptionalChoiceValue -Settings $settings -Name "SortWhen" -Prompt "Sort when? In standalone maintenance, Start/End/Both collapse to one pass." -Choices @("None", "Start", "End", "Both") -DefaultIndex 0
+        if ($settings.ContainsKey("SortWhen") -and $settings["SortWhen"] -ne "None") {
+            Set-OptionalChoiceValue -Settings $settings -Name "SortDirection" -Prompt "Sort direction?" -Choices @("Ascending", "Descending") -DefaultIndex 0
+        }
+    }
+
+    if (Read-InteractiveYesNo -Prompt "Review advanced maintenance and file safety options?" -Default $false) {
+        Set-OptionalIntValue -Settings $settings -Name "MaintenanceLargeFileLimitMB" -Prompt "Max MB for in-memory dedup/sort. 0 = no limit" -Default 1024
+        Set-OptionalSwitchValue -Settings $settings -Name "IgnoreMaintenanceLargeFileLimit" -Prompt "Ignore the maintenance large-file limit?" -Default $false
+        Set-OptionalIntValue -Settings $settings -Name "FileWriteRetryCount" -Prompt "Temp/output write retry attempts" -Default 5 -Minimum 1
+        Set-OptionalIntValue -Settings $settings -Name "FileWriteRetryDelayMinMs" -Prompt "Minimum write retry delay, ms" -Default 50
+        Set-OptionalIntValue -Settings $settings -Name "FileWriteRetryDelayMaxMs" -Prompt "Maximum write retry delay, ms" -Default 300
+        Set-OptionalIntValue -Settings $settings -Name "FileMoveRetryCount" -Prompt "Replace retry attempts" -Default 5 -Minimum 1
+        Set-OptionalIntValue -Settings $settings -Name "FileMoveRetryDelayMs" -Prompt "Replace retry delay, ms" -Default 300
+        Set-OptionalSwitchValue -Settings $settings -Name "AllowExtremeOperationalValues" -Prompt "Allow values above normal typo guardrails?" -Default $false
+    }
+
+    $commandLine = New-MaintenanceCommandFromInteractiveAnswers -CommandValue $commandValue -FilesValue $filesValue -Settings $settings
+
+    Write-Host ""
+    Write-Host "Generated command:" -ForegroundColor Green
+    Write-Host ""
+    Write-Host $commandLine -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Nothing was executed. Copy and run the command above when ready."
+}
+
+function Start-InteractiveHelp {
+    Write-Host ""
+    Write-Host "Find-WebLinks guided helper"
+    Write-Host "It asks questions and prints the command to run. It does not run the command."
+
+    $modeChoice = Read-InteractiveChoice -Prompt "What do you want help building?" -Choices @("Run / scrape links", "Maintenance only") -DefaultIndex 0
+
+    if ($modeChoice -eq "Maintenance only") {
+        Start-InteractiveMaintenanceCommandBuilder
+    }
+    else {
+        Start-InteractiveRunCommandBuilder
+    }
+}
+
+if ($Help) {
+    Show-Usage
+    exit 0
+}
+
+if ($InteractiveHelp) {
+    Start-InteractiveHelp
+    exit 0
+}
+
+if ($PSBoundParameters.Count -eq 0) {
+    Write-Host ""
+    Write-Host "Find-WebLinks was started without parameters."
+    $startupChoice = Read-InteractiveChoice -Prompt "What do you want to do?" -Choices @("Show help", "Interactive command builder", "Exit") -DefaultIndex 1
+
+    switch ($startupChoice) {
+        "Show help" {
+            Show-Usage
+            exit 0
+        }
+        "Interactive command builder" {
+            Start-InteractiveHelp
+            exit 0
+        }
+        "Exit" {
+            Write-Host "No command was run."
+            exit 0
+        }
+    }
 }
 
 if ($Command -eq "Run" -and (
