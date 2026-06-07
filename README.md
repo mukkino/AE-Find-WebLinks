@@ -103,7 +103,7 @@ Crawl discovery intentionally ignores `SearchPattern`. This is important because
 For example, if you search for:
 
 ```powershell
-"*comic*picture*"
+"*news*story*"
 ```
 
 the crawler may still follow pages that do not contain `comic` or `picture` in the URL, as long as those pages are allowed by the crawl scope. Only links matching `*comic*picture*` are saved.
