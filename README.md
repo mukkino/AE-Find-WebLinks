@@ -16,7 +16,7 @@ It is a raw-response extraction and crawling tool, not a browser. It does **not*
 
 Version `1.7.0` adds controlled crawling and link-following support while preserving the old default behaviour.
 
-By default, Find-WebLinks still scans only the source URL or URLs you provide. Crawling is disabled unless explicitly enabled with `-FollowDepth`, `-FollowUntilExhausted`, `-FollowToEnd`, or `-UnlimitedFollowDepth`.
+By default, AE-Find-WebLinks still scans only the source URL or URLs you provide. Crawling is disabled unless explicitly enabled with `-FollowDepth`, `-FollowUntilExhausted`, `-FollowToEnd`, or `-UnlimitedFollowDepth`.
 
 This version adds:
 
@@ -47,7 +47,7 @@ Crawl mode is intentionally sequential in this version. If crawling is enabled, 
 
 ## Main capabilities
 
-Find-WebLinks can:
+AE-Find-WebLinks can:
 
 * Scan one URL.
 * Scan many URLs from a text file.
