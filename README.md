@@ -106,7 +106,7 @@ For example, if you search for:
 "*news*story*"
 ```
 
-the crawler may still follow pages that do not contain `comic` or `picture` in the URL, as long as those pages are allowed by the crawl scope. Only links matching `*comic*picture*` are saved.
+the crawler may still follow pages that do not contain `news` or `story` in the URL, as long as those pages are allowed by the crawl scope. Only links matching `*news*story*` are saved.
 
 ---
 
