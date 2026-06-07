@@ -1,7 +1,8 @@
 #requires -Version 5.1
 
-# Find-WebLinks.ps1 - 1.6.2
+# AE-Find-WebLinks.ps1 - 1.7.0
 # Author: Fabio Lichinchi (mukka)
+# Site: alterego.cc
 # 
 # THE UNLICENSE
 # This is free and unencumbered software released into the public domain.
@@ -113,10 +114,68 @@ param(
     [ValidateRange(1, 2147483647)]
     [int]$TimeoutSeconds = 120,
 
-    # Delay between fetching different URLs when processing a file list
+    # Delay between fetching different URLs when processing a file list or crawl frontier
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 2147483647)]
     [int]$DelaySeconds = 5,
+
+    # Crawl/follow controls. Defaults preserve the old behaviour: fetch only the supplied source page(s).
+    # FollowDepth is link-hop depth: 0 = source page(s) only/no crawl, 1 = also fetch links found on source page(s), etc.
+    # -1 is accepted as shorthand for crawling until the allowed frontier is exhausted.
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(-1, 2147483647)]
+    [int]$FollowDepth = 0,
+
+    # Crawl until no more allowed links are discovered instead of stopping at a fixed hop depth.
+    # This still obeys FollowScope, FollowPathScope, FollowSubdomains, MaxSubdomainDepth,
+    # blacklist/private URL checks, static-asset skipping, robots.txt when enabled, and MaxFollowPages.
+    [Parameter(Mandatory = $false)]
+    [Alias("FollowToEnd", "UnlimitedFollowDepth")]
+    [switch]$FollowUntilExhausted,
+
+    # SameDomain uses an approximate registrable-domain/eTLD+1 boundary; see helper comments below.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("SameDomain", "SameHost", "Any")]
+    [string]$FollowScope = "SameDomain",
+
+    # Optional path/subtree boundary layered on top of FollowScope.
+    # Any = old behaviour. SeedPath = only follow URLs whose path is the seed
+    # path itself or a descendant path. Example seed /1 allows /1 and /1/2,
+    # but not /2 or /10.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Any", "SeedPath")]
+    [string]$FollowPathScope = "Any",
+
+    # When FollowScope is SameDomain, this controls whether non-seed subdomains are crawlable.
+    # By default only the seed host(s), the apex/root domain, and www.<root> are followed.
+    [Parameter(Mandatory = $false)]
+    [bool]$FollowSubdomains = $false,
+
+    # Only used when -FollowSubdomains is true. Default 1 means direct
+    # subdomains only; 0 = no subdomain-depth limit. Example with root
+    # example.com: depth 1 allows blog.example.com; depth 2 also allows
+    # deep.blog.example.com.
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 2147483647)]
+    [int]$MaxSubdomainDepth = 1,
+
+    # Safety cap for crawling. 0 = no cap. Applies only when crawl mode is enabled.
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 2147483647)]
+    [int]$MaxFollowPages = 1000,
+
+    # Opt-in robots.txt enforcement. Off by default to preserve existing behaviour.
+    # When enabled, robots.txt is checked before fetching source URLs, crawl URLs,
+    # and HTTP/meta-refresh redirect targets.
+    [Parameter(Mandatory = $false)]
+    [switch]$EnforceRobotsTxt,
+
+    # Product token used to match User-agent groups in robots.txt when
+    # -EnforceRobotsTxt is enabled. This is intentionally separate from the HTTP
+    # User-Agent header, which may be a full browser-style string.
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$RobotsUserAgent = "AE-Find-WebLinks",
 
     # Fetches the same URL twice to bypass simple cookie-walls or anti-bot screens
     [Parameter(Mandatory = $false)]
@@ -299,6 +358,17 @@ $ProgressPreference = 'SilentlyContinue'
 # up-front and let downstream guardrails skip themselves.
 $Script:SkipOperationalValidation = $Help -or $InteractiveHelp -or ($PSBoundParameters.Count -eq 0)
 
+# Effective crawl mode. Keep -FollowDepth 0 as "no crawl" because that is the
+# default requested for link following and preserves old commands. Unlimited
+# crawling is explicit: use -FollowUntilExhausted or -FollowDepth -1.
+$Script:FollowDepthUnlimited = ([bool]$FollowUntilExhausted -or $FollowDepth -lt 0)
+$Script:CrawlEnabled = ($FollowDepth -gt 0 -or $Script:FollowDepthUnlimited)
+$Script:FollowDepthDisplay = if ($Script:FollowDepthUnlimited) { "until exhausted" } else { [string]$FollowDepth }
+
+if (-not $Script:SkipOperationalValidation -and [bool]$FollowUntilExhausted -and $FollowDepth -gt 0) {
+    throw "Use either -FollowUntilExhausted/-FollowToEnd or a positive -FollowDepth value, not both. For unlimited crawling, use -FollowUntilExhausted, -FollowToEnd, or -FollowDepth -1."
+}
+
 # Validate logical sequence of I/O retry limits
 if (-not $Script:SkipOperationalValidation -and $FileWriteRetryDelayMinMs -gt $FileWriteRetryDelayMaxMs) {
     throw "-FileWriteRetryDelayMinMs cannot be greater than -FileWriteRetryDelayMaxMs."
@@ -335,6 +405,9 @@ Assert-OperationalGuardrail -Name "RetryCount" -Value $RetryCount -SafeMaximum 1
 Assert-OperationalGuardrail -Name "WaitSeconds" -Value $WaitSeconds -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "TimeoutSeconds" -Value $TimeoutSeconds -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "DelaySeconds" -Value $DelaySeconds -SafeMaximum 86400
+Assert-OperationalGuardrail -Name "FollowDepth" -Value $FollowDepth -SafeMaximum 10
+Assert-OperationalGuardrail -Name "MaxSubdomainDepth" -Value $MaxSubdomainDepth -SafeMaximum 100
+Assert-OperationalGuardrail -Name "MaxFollowPages" -Value $MaxFollowPages -SafeMaximum 1000000
 Assert-OperationalGuardrail -Name "SecondFetchWait" -Value $SecondFetchWait -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "ThrottleLimit" -Value $ThrottleLimit -SafeMaximum 64
 Assert-OperationalGuardrail -Name "MaxPageContentMB" -Value $MaxPageContentMB -SafeMaximum 1024
@@ -391,6 +464,13 @@ else {
 # a routine knob. Five seconds comfortably covers normal authoritative servers.
 [int]$Script:DnsResolutionTimeoutSeconds = 5
 
+# robots.txt cache is per process/runspace and keyed by origin (scheme + host + port).
+# Enforcement is opt-in via -EnforceRobotsTxt.
+[int]$Script:MaxRobotsTxtBytes = 512000
+$Script:RobotsTxtCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+
 $Script:RegexTimeout = if ($RegexTimeoutSeconds -eq 0) {
     # Infinite match timeout means catastrophic backtracking on a crafted URL
     # can lock the worker thread inside unmanaged regex code, where Ctrl+C
@@ -411,17 +491,17 @@ function Show-Usage {
     Write-Host ""
     Write-Host "Usage:"
     Write-Host "  Help and command builder:"
-    Write-Host "  .\Find-WebLinks.ps1 -Help"
-    Write-Host "  .\Find-WebLinks.ps1 -InteractiveHelp"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Help"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -InteractiveHelp"
     Write-Host ""
     Write-Host "  Run / scrape mode:"
-    Write-Host "  .\Find-WebLinks.ps1 <Source> <SearchPattern> <OutputFile> [Mode] [SourceType] [options]"
-    Write-Host "  .\Find-WebLinks.ps1 <Source> -SearchPatterns <patterns> -OutputFile <OutputFile> [options]"
+    Write-Host "  .\AE-Find-WebLinks.ps1 <Source> <SearchPattern> <OutputFile> [Mode] [SourceType] [options]"
+    Write-Host "  .\AE-Find-WebLinks.ps1 <Source> -SearchPatterns <patterns> -OutputFile <OutputFile> [options]"
     Write-Host ""
     Write-Host "  Maintenance-only mode, no downloading:"
-    Write-Host "  .\Find-WebLinks.ps1 -Command Deduplicate -Files <f1>,<f2>"
-    Write-Host "  .\Find-WebLinks.ps1 -Command Sort -Files <f1>,<f2> [-SortDirection Ascending|Descending]"
-    Write-Host "  .\Find-WebLinks.ps1 -Command Maintain -Files <f1>,<f2> -DeduplicateWhen <Start|End|Both> -SortWhen <Start|End|Both>"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Command Deduplicate -Files <f1>,<f2>"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Command Sort -Files <f1>,<f2> [-SortDirection Ascending|Descending]"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Command Maintain -Files <f1>,<f2> -DeduplicateWhen <Start|End|Both> -SortWhen <Start|End|Both>"
     Write-Host ""
     Write-Host "Arguments:"
     Write-Host "  Source          What to scrape. This is either a URL or a text file path,"
@@ -447,7 +527,8 @@ function Show-Usage {
     Write-Host "SourceType (optional, default: Url):"
     Write-Host "  Url       Source is a single web page URL. The script fetches that one"
     Write-Host "            page and extracts all links from it."
-    Write-Host "  File      Source is a text file containing a list of URLs, one per line."
+    Write-Host "  File      Source is a text file containing URLs. Standard format is one"
+    Write-Host "            URL per line; multiple URLs on one line are also accepted."
     Write-Host "            The script reads every URL from the file, deduplicates them,"
     Write-Host "            fetches each page one by one, and extracts links from all of"
     Write-Host "            them. Results are written to the output file after each page."
@@ -458,7 +539,16 @@ function Show-Usage {
     Write-Host "  -RetryCount <n>            Number of retry attempts per URL (default: 3)"
     Write-Host "  -WaitSeconds <n>           Seconds to wait between retries of the same URL (default: 30)"
     Write-Host "  -TimeoutSeconds <n>        HTTP timeout per request attempt (default: 120)"
-    Write-Host "  -DelaySeconds <n>          Seconds to wait between different URLs in File mode (default: 5)"
+    Write-Host "  -DelaySeconds <n>          Seconds to wait between different URLs in File/crawl mode (default: 5)"
+    Write-Host "  -FollowDepth <n>           Link-hop depth. 0 = none/default; -1 = until exhausted"
+    Write-Host "  -FollowUntilExhausted      Crawl until no new allowed pages remain (aliases: -FollowToEnd, -UnlimitedFollowDepth)"
+    Write-Host "  -FollowScope <scope>       Host/domain crawl boundary: SameDomain, SameHost, or Any (default: SameDomain)"
+    Write-Host "  -FollowPathScope <scope>   Path crawl boundary: Any or SeedPath (default: Any)"
+    Write-Host "  -FollowSubdomains <bool>   In SameDomain mode, follow non-seed subdomains (default: false)"
+    Write-Host "  -MaxSubdomainDepth <n>     Max subdomain labels when FollowSubdomains is true. Default: 1; 0 = no limit"
+    Write-Host "  -MaxFollowPages <n>        Safety cap for crawled pages when crawl mode is enabled (default: 1000, 0 = no cap)"
+    Write-Host "  -EnforceRobotsTxt         Enforce robots.txt before fetching URLs/redirect targets (default: off)"
+    Write-Host "  -RobotsUserAgent <token>  robots.txt User-agent product token (default: AE-Find-WebLinks)"
     Write-Host "  -SecondFetch <bool>        Fetch each URL twice, keep the larger response (default: true)"
     Write-Host "  -SecondFetchWait <n>       Seconds to wait before the second fetch (default: 5)"
     Write-Host "  -KeepDuplicates            Keep duplicate matches found within the same page"
@@ -505,11 +595,11 @@ function Show-Usage {
     Write-Host "                                      In standalone mode Start/End/Both collapse to one pass"
     Write-Host ""
     Write-Host "Maintenance examples:"
-    Write-Host "  .\Find-WebLinks.ps1 -Command Deduplicate -Files .\a.txt,.\b.txt"
-    Write-Host "  .\Find-WebLinks.ps1 -Command Sort -Files .\a.txt,.\b.txt -SortDirection Descending"
-    Write-Host "  .\Find-WebLinks.ps1 -Command Deduplicate -Files .\huge.txt -MaintenanceLargeFileLimitMB 0"
-    Write-Host "  .\Find-WebLinks.ps1 -Command Maintain -Files .\a.txt,.\b.txt -DeduplicateWhen Start -SortWhen End"
-    Write-Host "  .\Find-WebLinks.ps1 .\urls.txt `"*zip*`" .\matches.txt Append File -DeduplicateWhen Start -SortWhen End"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Command Deduplicate -Files .\a.txt,.\b.txt"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Command Sort -Files .\a.txt,.\b.txt -SortDirection Descending"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Command Deduplicate -Files .\huge.txt -MaintenanceLargeFileLimitMB 0"
+    Write-Host "  .\AE-Find-WebLinks.ps1 -Command Maintain -Files .\a.txt,.\b.txt -DeduplicateWhen Start -SortWhen End"
+    Write-Host "  .\AE-Find-WebLinks.ps1 .\urls.txt `"*zip*`" .\matches.txt Append File -DeduplicateWhen Start -SortWhen End"
     Write-Host ""
     Write-Host "Resume behaviour:"
     Write-Host "  In File mode, the script writes each completed source URL to a progress file."
@@ -521,60 +611,80 @@ function Show-Usage {
     Write-Host "Examples -- single URL (SourceType = Url):"
     Write-Host ""
     Write-Host "  Fetch one page, find sport links, write to a new file:"
-    Write-Host "  .\Find-WebLinks.ps1 `"https://www.bbc.co.uk/news`" `"*sport*`" `"C:\Temp\bbc-links.txt`" New"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://www.bbc.co.uk/news`" `"*sport*`" `"C:\Temp\bbc-links.txt`" New"
     Write-Host ""
     Write-Host "  Fetch one page, find politics links, append to the same file:"
-    Write-Host "  .\Find-WebLinks.ps1 `"https://www.bbc.co.uk/news`" `"*politics*`" `"C:\Temp\bbc-links.txt`""
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://www.bbc.co.uk/news`" `"*politics*`" `"C:\Temp\bbc-links.txt`""
     Write-Host ""
     Write-Host "  Same but with custom retry settings:"
-    Write-Host "  .\Find-WebLinks.ps1 `"bbc.co.uk/news`" `"*weather*`" `".\bbc-links.txt`" -WaitSeconds 60 -RetryCount 5"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"bbc.co.uk/news`" `"*weather*`" `".\bbc-links.txt`" -WaitSeconds 60 -RetryCount 5"
     Write-Host ""
     Write-Host "Examples -- list of URLs (SourceType = File):"
     Write-Host ""
     Write-Host "  Read URLs from a text file, fetch every page, find sport links:"
-    Write-Host "  .\Find-WebLinks.ps1 `"C:\Temp\urls.txt`" `"*sport*`" `"C:\Temp\matched.txt`" New File"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"C:\Temp\urls.txt`" `"*sport*`" `"C:\Temp\matched.txt`" New File"
     Write-Host ""
     Write-Host "  Same but append to existing output:"
-    Write-Host "  .\Find-WebLinks.ps1 `"C:\Temp\urls.txt`" `"*news*`" `"C:\Temp\matched.txt`" Append File"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"C:\Temp\urls.txt`" `"*news*`" `"C:\Temp\matched.txt`" Append File"
     Write-Host ""
     Write-Host "Examples -- multiple search patterns:"
     Write-Host ""
     Write-Host "  Match links containing news OR sport OR weather (Any mode, default):"
-    Write-Host "  .\Find-WebLinks.ps1 `"bbc.co.uk`" `"*news*`" `"out.txt`" -SearchPatterns `"*sport*`",`"*weather*`""
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"bbc.co.uk`" `"*news*`" `"out.txt`" -SearchPatterns `"*sport*`",`"*weather*`""
     Write-Host ""
     Write-Host "  Match links containing BOTH news AND 2026 (All mode):"
-    Write-Host "  .\Find-WebLinks.ps1 `"bbc.co.uk`" `"*news*`" `"out.txt`" -SearchPatterns `"*2026*`" -SearchMode All"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"bbc.co.uk`" `"*news*`" `"out.txt`" -SearchPatterns `"*2026*`" -SearchMode All"
     Write-Host ""
     Write-Host "  Use only -SearchPatterns, without a main positional SearchPattern:"
-    Write-Host "  .\Find-WebLinks.ps1 `"bbc.co.uk`" -SearchPatterns `"*news*`",`"*sport*`" -OutputFile `"out.txt`""
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"bbc.co.uk`" -SearchPatterns `"*news*`",`"*sport*`" -OutputFile `"out.txt`""
     Write-Host ""
     Write-Host "Examples -- include and exclude wildcard patterns:"
     Write-Host ""
     Write-Host "  Save links containing download OR game, but exclude demo and trailer links:"
-    Write-Host "  .\Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*download*`",`"*game*`" -ExcludePatterns `"*demo*`",`"*trailer*`" -OutputFile `"matched.txt`" Append File"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*download*`",`"*game*`" -ExcludePatterns `"*demo*`",`"*trailer*`" -OutputFile `"matched.txt`" Append File"
     Write-Host ""
     Write-Host "  Save links containing BOTH amiga AND lha, but exclude links containing beta:"
-    Write-Host "  .\Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*amiga*`",`"*lha*`" -SearchMode All -ExcludePattern `"*beta*`" -OutputFile `"matched.txt`" Append File"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*amiga*`",`"*lha*`" -SearchMode All -ExcludePattern `"*beta*`" -OutputFile `"matched.txt`" Append File"
     Write-Host ""
     Write-Host "  Exclude only when BOTH unwanted words are present in the same link:"
-    Write-Host "  .\Find-WebLinks.ps1 `"urls.txt`" `"*download*`" `"matched.txt`" Append File -ExcludePatterns `"*demo*`",`"*trial*`" -ExcludeMode All"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" `"*download*`" `"matched.txt`" Append File -ExcludePatterns `"*demo*`",`"*trial*`" -ExcludeMode All"
     Write-Host ""
     Write-Host "  With CSV log and failed URL tracking (fresh log files, append output):"
-    Write-Host "  .\Find-WebLinks.ps1 `"urls.txt`" `"*news*`" `"matched.txt`" Append File -LogCsv `"run-log.csv`" -LogMode New -FailedUrlFile `"failed.txt`" -FailedUrlMode New"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" `"*news*`" `"matched.txt`" Append File -LogCsv `"run-log.csv`" -LogMode New -FailedUrlFile `"failed.txt`" -FailedUrlMode New"
+    Write-Host ""
+    Write-Host "Examples -- crawling/following links:"
+    Write-Host ""
+    Write-Host "  Fetch the source page, then fetch same-domain links found on it; save only links matching *lha*:"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com`" `"*lha*`" `"matched.txt`" New -FollowDepth 1"
+    Write-Host ""
+    Write-Host "  Crawl two link hops, stay on the same exact host, and cap the crawl at 250 fetched pages:"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://www.example.com`" `"*download*`" `"matched.txt`" New -FollowDepth 2 -FollowScope SameHost -MaxFollowPages 250"
+    Write-Host ""
+    Write-Host "  Crawl only inside the starting path/subtree. Example /1 allows /1/2 but not /2:"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com/1`" `"*news*story*`" `"matched.txt`" New -FollowDepth 10 -FollowScope SameDomain -FollowPathScope SeedPath"
+    Write-Host ""
+    Write-Host "  Crawl until the allowed frontier is exhausted; default MaxFollowPages is still 1000:"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com/1`" `"*news*story*`" `"matched.txt`" New -FollowUntilExhausted -FollowScope SameDomain -FollowPathScope SeedPath"
+    Write-Host ""
+    Write-Host "  Crawl same-domain direct subdomains too, but not deeper nested subdomains:"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com`" `"*zip*`" `"matched.txt`" New -FollowDepth 2 -FollowSubdomains:`$true -MaxSubdomainDepth 1"
+    Write-Host ""
+    Write-Host "  Crawl with opt-in robots.txt enforcement:"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com`" `"*lha*`" `"matched.txt`" New -FollowDepth 1 -EnforceRobotsTxt"
     Write-Host ""
     Write-Host "Examples -- blacklist:"
     Write-Host ""
     Write-Host "  Blacklist applied to both input and output (default):"
-    Write-Host "  .\Find-WebLinks.ps1 `"urls.txt`" `"*`" `"out.txt`" Append File -BlacklistFile `"blocked.txt`""
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" `"*`" `"out.txt`" Append File -BlacklistFile `"blocked.txt`""
     Write-Host ""
     Write-Host "  Blacklist applied only to extracted output links:"
-    Write-Host "  .\Find-WebLinks.ps1 `"urls.txt`" `"*`" `"out.txt`" Append File -BlacklistFile `"blocked.txt`" -BlacklistScope Output"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" `"*`" `"out.txt`" Append File -BlacklistFile `"blocked.txt`" -BlacklistScope Output"
     Write-Host ""
     Write-Host "  Blacklist applied only to input URLs (skip fetching, keep in output):"
-    Write-Host "  .\Find-WebLinks.ps1 `"urls.txt`" `"*`" `"out.txt`" Append File -BlacklistFile `"blocked.txt`" -BlacklistScope Input"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" `"*`" `"out.txt`" Append File -BlacklistFile `"blocked.txt`" -BlacklistScope Input"
     Write-Host ""
     Write-Host "  Multiple blacklist files:"
-    Write-Host "  .\Find-WebLinks.ps1 `"bbc.co.uk`" `"*`" `"out.txt`" -BlacklistFile `"ads.txt`",`"tracking.txt`""
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"bbc.co.uk`" `"*`" `"out.txt`" -BlacklistFile `"ads.txt`",`"tracking.txt`""
     Write-Host ""
     Write-Host "Disabling defaults:"
     Write-Host "  -NoDuplicates:`$false     Allow links already written/in output to be written again"
@@ -591,6 +701,23 @@ function Show-Usage {
     Write-Host "    Input   Skip blacklisted URLs from the source list before fetching"
     Write-Host "    Output  Remove blacklisted URLs from extracted/matched results only"
     Write-Host "    Both    Do both (default)"
+    Write-Host ""
+    Write-Host "Crawling behaviour:"
+    Write-Host "  -FollowDepth controls which extracted links are fetched as additional pages."
+    Write-Host "  0 means no crawling/default; -1, -FollowUntilExhausted, or -FollowToEnd crawls until"
+    Write-Host "  no more allowed pages remain. MaxFollowPages is the crawl safety cap."
+    Write-Host "  The search/exclude patterns only control what gets written to OutputFile."
+    Write-Host "  Crawl candidates are followed by scope/depth rules even when they do not"
+    Write-Host "  match the search pattern, otherwise crawler discovery becomes too narrow."
+    Write-Host "  -FollowPathScope SeedPath adds a URL-subtree boundary on top of"
+    Write-Host "  -FollowScope. For seed https://example.com/1, it allows /1 and"
+    Write-Host "  /1/... but rejects /2 and /10. Query strings and fragments are"
+    Write-Host "  ignored for this boundary."
+    Write-Host "  SameDomain uses a built-in approximation of registrable domains. For exact"
+    Write-Host "  eTLD+1 handling across every public/private suffix, use a Public Suffix List"
+    Write-Host "  library in a larger crawler architecture."
+    Write-Host "  robots.txt is not enforced unless -EnforceRobotsTxt is supplied. When enabled,"
+    Write-Host "  source pages, crawl pages, and redirect targets are checked before fetching."
     Write-Host ""
     Write-Host "Note:"
     Write-Host "  This script downloads the raw HTTP response. It does NOT execute"
@@ -640,6 +767,7 @@ function Format-PowerShellArrayLiteral {
 function Add-CommandValue {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[string]]$Parts,
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -667,6 +795,7 @@ function Add-CommandValue {
 function Add-CommandIntValue {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[string]]$Parts,
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -682,6 +811,7 @@ function Add-CommandIntValue {
 function Add-CommandBoolValue {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[string]]$Parts,
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -697,6 +827,7 @@ function Add-CommandBoolValue {
 function Add-CommandSwitch {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[string]]$Parts,
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -943,6 +1074,7 @@ function Edit-RunOptionalSettings {
                 "Finish and generate command",
                 "Resume, blacklist, logging, and files",
                 "Retry, network, proxy, and fetching",
+                "Crawling and link-following",
                 "Duplicates, sorting, and maintenance",
                 "Limits, performance, and safety guardrails"
             ) `
@@ -991,9 +1123,37 @@ function Edit-RunOptionalSettings {
                 }
                 Set-OptionalTextValue -Settings $Settings -Name "Proxy" -Prompt "Proxy URL? Example: http://proxy:8080. Leave blank for none"
                 Set-OptionalTextValue -Settings $Settings -Name "UserAgent" -Prompt "Custom User-Agent? Leave blank for default"
+                Set-OptionalSwitchValue -Settings $Settings -Name "EnforceRobotsTxt" -Prompt "Enforce robots.txt before fetching URLs and redirects?" -Default $false
+                if ($Settings.ContainsKey("EnforceRobotsTxt") -and [bool]$Settings["EnforceRobotsTxt"]) {
+                    Set-OptionalTextValue -Settings $Settings -Name "RobotsUserAgent" -Prompt "robots.txt User-agent product token" -Default "AE-Find-WebLinks"
+                }
                 Set-OptionalIntValue -Settings $Settings -Name "MaxRedirects" -Prompt "Maximum HTTP/meta-refresh redirects" -Default 10 -Minimum 1
                 Set-OptionalIntValue -Settings $Settings -Name "MaxRetryAfterSeconds" -Prompt "Maximum server Retry-After seconds to honour. 0 = ignore" -Default 300
                 Set-OptionalIntValue -Settings $Settings -Name "ConnectionLimit" -Prompt ".NET HTTP connection limit" -Default 100 -Minimum 1
+            }
+
+            "Crawling and link-following" {
+                Set-OptionalSwitchValue -Settings $Settings -Name "FollowUntilExhausted" -Prompt "Crawl until no new allowed pages remain?" -Default $false
+                if (-not ($Settings.ContainsKey("FollowUntilExhausted") -and [bool]$Settings["FollowUntilExhausted"])) {
+                    Set-OptionalIntValue -Settings $Settings -Name "FollowDepth" -Prompt "Link-hop depth to follow. 0 = source page(s) only/no crawl; -1 = until exhausted" -Default 0 -Minimum -1
+                }
+
+                $crawlRequested = $false
+                if ($Settings.ContainsKey("FollowUntilExhausted") -and [bool]$Settings["FollowUntilExhausted"]) { $crawlRequested = $true }
+                if ($Settings.ContainsKey("FollowDepth") -and [int]$Settings["FollowDepth"] -ne 0) { $crawlRequested = $true }
+
+                if ($crawlRequested) {
+                    Set-OptionalChoiceValue -Settings $Settings -Name "FollowScope" -Prompt "Which host/domain links may be followed?" -Choices @("SameDomain", "SameHost", "Any") -DefaultIndex 0
+                    Set-OptionalChoiceValue -Settings $Settings -Name "FollowPathScope" -Prompt "Restrict crawling to the starting URL path/subtree?" -Choices @("Any", "SeedPath") -DefaultIndex 0
+                    if (-not $Settings.ContainsKey("DelaySeconds")) {
+                        Set-OptionalIntValue -Settings $Settings -Name "DelaySeconds" -Prompt "Seconds between crawled URLs" -Default 5
+                    }
+                    Set-OptionalBoolValue -Settings $Settings -Name "FollowSubdomains" -Prompt "In SameDomain mode, follow non-seed subdomains?" -Default $false
+                    if ($Settings.ContainsKey("FollowSubdomains") -and [bool]$Settings["FollowSubdomains"]) {
+                        Set-OptionalIntValue -Settings $Settings -Name "MaxSubdomainDepth" -Prompt "Maximum subdomain depth. 1 = direct subdomains, 0 = no limit" -Default 1
+                    }
+                    Set-OptionalIntValue -Settings $Settings -Name "MaxFollowPages" -Prompt "Maximum pages to fetch during crawl. 0 = no cap" -Default 1000
+                }
             }
 
             "Duplicates, sorting, and maintenance" {
@@ -1045,7 +1205,7 @@ function New-RunCommandFromInteractiveAnswers {
     )
 
     $parts = New-Object System.Collections.Generic.List[string]
-    [void]$parts.Add(".\Find-WebLinks.ps1")
+    [void]$parts.Add(".\AE-Find-WebLinks.ps1")
 
     Add-CommandValue -Parts $parts -Name "Source" -Value $Source -Always
 
@@ -1076,8 +1236,8 @@ function New-RunCommandFromInteractiveAnswers {
 
     # Append standard string settings
     foreach ($name in @(
-        "BlacklistScope", "LogMode", "FailedUrlMode", "SortDirection", "DeduplicateWhen", "SortWhen",
-        "Proxy", "UserAgent", "ProgressFile", "LogCsv", "FailedUrlFile"
+        "BlacklistScope", "FollowScope", "FollowPathScope", "LogMode", "FailedUrlMode", "SortDirection", "DeduplicateWhen", "SortWhen",
+        "Proxy", "UserAgent", "RobotsUserAgent", "ProgressFile", "LogCsv", "FailedUrlFile"
     )) {
         if ($Settings.ContainsKey($name)) {
             Add-CommandValue -Parts $parts -Name $name -Value $Settings[$name]
@@ -1093,8 +1253,8 @@ function New-RunCommandFromInteractiveAnswers {
 
     # Append Integer settings
     foreach ($name in @(
-        "RetryCount", "WaitSeconds", "TimeoutSeconds", "DelaySeconds", "SecondFetchWait", "ThrottleLimit",
-        "MaxRedirects", "MaxRetryAfterSeconds", "ConnectionLimit", "MaintenanceLargeFileLimitMB",
+        "RetryCount", "WaitSeconds", "TimeoutSeconds", "DelaySeconds", "FollowDepth", "MaxSubdomainDepth", "MaxFollowPages",
+        "SecondFetchWait", "ThrottleLimit", "MaxRedirects", "MaxRetryAfterSeconds", "ConnectionLimit", "MaintenanceLargeFileLimitMB",
         "MaxPageContentMB", "RegexTimeoutSeconds", "MaxUrlLength", "FileWriteRetryCount",
         "FileWriteRetryDelayMinMs", "FileWriteRetryDelayMaxMs", "FileMoveRetryCount", "FileMoveRetryDelayMs",
         "HighFailureRatePercent"
@@ -1105,7 +1265,7 @@ function New-RunCommandFromInteractiveAnswers {
     }
 
     # Append boolean settings
-    foreach ($name in @("SecondFetch", "NoDuplicates", "SortOutput")) {
+    foreach ($name in @("SecondFetch", "FollowSubdomains", "NoDuplicates", "SortOutput")) {
         if ($Settings.ContainsKey($name)) {
             Add-CommandBoolValue -Parts $parts -Name $name -Value $Settings[$name]
         }
@@ -1113,7 +1273,7 @@ function New-RunCommandFromInteractiveAnswers {
 
     # Append Switch settings
     foreach ($name in @(
-        "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments",
+        "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments", "EnforceRobotsTxt", "FollowUntilExhausted",
         "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues"
     )) {
         if ($Settings.ContainsKey($name)) {
@@ -1190,7 +1350,7 @@ function New-MaintenanceCommandFromInteractiveAnswers {
     )
 
     $parts = New-Object System.Collections.Generic.List[string]
-    [void]$parts.Add(".\Find-WebLinks.ps1")
+    [void]$parts.Add(".\AE-Find-WebLinks.ps1")
 
     Add-CommandValue -Parts $parts -Name "Command" -Value $CommandValue -Always
     Add-CommandValue -Parts $parts -Name "Files" -Value $FilesValue -Always
@@ -1273,7 +1433,7 @@ function Start-InteractiveMaintenanceCommandBuilder {
 
 function Start-InteractiveHelp {
     Write-Host ""
-    Write-Host "Find-WebLinks guided helper"
+    Write-Host "AE-Find-WebLinks guided helper"
     Write-Host "It asks questions and prints the command to run. It does not run the command."
 
     $modeChoice = Read-InteractiveChoice -Prompt "What do you want help building?" -Choices @("Run / scrape links", "Maintenance only") -DefaultIndex 0
@@ -1303,7 +1463,7 @@ if ($InteractiveHelp) {
 
 if ($PSBoundParameters.Count -eq 0) {
     Write-Host ""
-    Write-Host "Find-WebLinks was started without parameters."
+    Write-Host "AE-Find-WebLinks was started without parameters."
     $startupChoice = Read-InteractiveChoice -Prompt "What do you want to do?" -Choices @("Show help", "Interactive command builder", "Exit") -DefaultIndex 1
 
     switch ($startupChoice) {
@@ -1652,6 +1812,334 @@ function Get-LinkWriteValue {
     return $trimmed
 }
 
+
+# ---------------------------------------------------------------------------
+# Crawl boundary helpers
+# ---------------------------------------------------------------------------
+# Standard crawler implementations normally use the Public Suffix List (PSL) to
+# calculate the registrable domain/eTLD+1. Example: www.example.co.uk belongs to
+# example.co.uk, not co.uk. This standalone script avoids network/package
+# dependencies, so Get-RegistrableDomain uses a conservative built-in heuristic:
+# last two labels normally, or last three labels for common ccTLD second-level
+# suffixes such as co.uk/com.au. This is good enough for ordinary sites, but it
+# is not a full PSL replacement and cannot know private suffixes such as
+# github.io, appspot.com, or blogspot.com. Use -FollowScope SameHost when you
+# need the safest possible boundary, or integrate a PSL library for exact logic.
+function Get-UrlHost {
+    param([AllowNull()][string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+
+    try {
+        $uri = [uri]$Url
+        if ($uri.IsAbsoluteUri -and $uri.Scheme -match '^https?$' -and -not [string]::IsNullOrWhiteSpace($uri.Host)) {
+            return $uri.Host.TrimEnd('.').ToLowerInvariant()
+        }
+    }
+    catch { }
+
+    return $null
+}
+
+function Test-HostIsIPAddress {
+    param([AllowNull()][string]$HostName)
+
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+
+    $ip = $null
+    return [System.Net.IPAddress]::TryParse($HostName.Trim('[', ']', ' '), [ref]$ip)
+}
+
+function Get-RegistrableDomain {
+    param([AllowNull()][string]$HostName)
+
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $null }
+
+    $cleanHost = $HostName.Trim().TrimEnd('.').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($cleanHost)) { return $null }
+    if (Test-HostIsIPAddress -HostName $cleanHost) { return $cleanHost }
+
+    $labels = @($cleanHost -split '\.' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($labels.Count -le 2) { return ($labels -join '.') }
+
+    $tld = $labels[$labels.Count - 1]
+    $sld = $labels[$labels.Count - 2]
+
+    # Common public second-level labels under ccTLDs. This deliberately remains
+    # small and generic; it prevents dangerous broad matches like co.uk while
+    # avoiding a pretend full PSL implementation.
+    $commonCcSecondLevelLabels = @(
+        'ac','co','com','edu','gov','net','org','mil','mod','nhs','nic','nom','plc','police','sch',
+        'asso','gob','go','or','ne','re','id','web','gen','firm','store','arts','rec','info'
+    )
+
+    if ($tld.Length -eq 2 -and $commonCcSecondLevelLabels -contains $sld -and $labels.Count -ge 3) {
+        return ($labels[($labels.Count - 3)..($labels.Count - 1)] -join '.')
+    }
+
+    return ($labels[($labels.Count - 2)..($labels.Count - 1)] -join '.')
+}
+
+function Get-SubdomainDepthForRoot {
+    param(
+        [AllowNull()][string]$HostName,
+        [AllowNull()][string]$RootDomain
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HostName) -or [string]::IsNullOrWhiteSpace($RootDomain)) { return -1 }
+
+    $hostClean = $HostName.Trim().TrimEnd('.').ToLowerInvariant()
+    $rootClean = $RootDomain.Trim().TrimEnd('.').ToLowerInvariant()
+
+    if ($hostClean -ieq $rootClean) { return 0 }
+    if (-not $hostClean.EndsWith(".$rootClean", [System.StringComparison]::OrdinalIgnoreCase)) { return -1 }
+
+    $prefixLength = $hostClean.Length - $rootClean.Length - 1
+    if ($prefixLength -le 0) { return 0 }
+
+    $prefix = $hostClean.Substring(0, $prefixLength)
+    if ([string]::IsNullOrWhiteSpace($prefix)) { return 0 }
+
+    return @($prefix -split '\.' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+}
+
+function Get-UrlPathPrefix {
+    param([AllowNull()][string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+
+    try {
+        $normalizedUrl = ConvertTo-NormalizedLink -Link $Url
+        if (-not $normalizedUrl) { return $null }
+
+        $uri = [uri]$normalizedUrl
+        if (-not $uri.IsAbsoluteUri -or $uri.Scheme -notmatch '^https?$') { return $null }
+
+        # AbsolutePath excludes query and fragment. This is intentional: /1?a=b
+        # and /1#top are still inside the /1 path boundary.
+        $path = $uri.AbsolutePath
+        if ([string]::IsNullOrWhiteSpace($path)) { return "/" }
+        if (-not $path.StartsWith("/")) { $path = "/$path" }
+
+        # Treat /1 and /1/ as the same subtree root. Root remains root.
+        if ($path.Length -gt 1) {
+            $path = $path.TrimEnd('/')
+            if ([string]::IsNullOrWhiteSpace($path)) { return "/" }
+        }
+
+        return $path
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-UrlPathUnderPrefix {
+    param(
+        [AllowNull()][string]$Url,
+        [AllowNull()][string]$PathPrefix
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($PathPrefix)) { return $false }
+
+    $prefix = $PathPrefix
+    if (-not $prefix.StartsWith("/")) { $prefix = "/$prefix" }
+    if ($prefix.Length -gt 1) { $prefix = $prefix.TrimEnd('/') }
+    if ([string]::IsNullOrWhiteSpace($prefix) -or $prefix -eq "/") { return $true }
+
+    $candidatePath = Get-UrlPathPrefix -Url $Url
+    if ([string]::IsNullOrWhiteSpace($candidatePath)) { return $false }
+
+    # URL paths are case-sensitive on many servers. Use Ordinal rather than
+    # OrdinalIgnoreCase so /Games and /games do not get silently collapsed.
+    if ([string]::Equals($candidatePath, $prefix, [System.StringComparison]::Ordinal)) { return $true }
+    return $candidatePath.StartsWith("$prefix/", [System.StringComparison]::Ordinal)
+}
+
+function New-FollowBoundary {
+    param([AllowNull()][string[]]$SeedUrls)
+
+    $hosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $domains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seedPathRules = [System.Collections.Generic.List[object]]::new()
+    $seedPathRuleKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+    foreach ($seedUrl in @($SeedUrls)) {
+        if ([string]::IsNullOrWhiteSpace($seedUrl)) { continue }
+
+        $normalizedSeed = ConvertTo-NormalizedLink -Link $seedUrl
+        if (-not $normalizedSeed) { continue }
+
+        $seedHost = Get-UrlHost -Url $normalizedSeed
+        if (-not $seedHost) { continue }
+
+        [void]$hosts.Add($seedHost)
+
+        $domain = Get-RegistrableDomain -HostName $seedHost
+        if ($domain) {
+            [void]$domains.Add($domain)
+        }
+
+        $pathPrefix = Get-UrlPathPrefix -Url $normalizedSeed
+        if (-not [string]::IsNullOrWhiteSpace($pathPrefix)) {
+            $pathRuleKey = @($seedHost, $domain, $pathPrefix) -join ([string][char]0x1F)
+            if ($seedPathRuleKeys.Add($pathRuleKey)) {
+                $seedPathRules.Add([pscustomobject]@{
+                    Host       = $seedHost
+                    Domain     = $domain
+                    PathPrefix = $pathPrefix
+                })
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Hosts         = $hosts
+        Domains       = $domains
+        SeedPathRules = $seedPathRules
+    }
+}
+
+function Test-IsLikelyCrawlablePageUrl {
+    param([AllowNull()][string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $false }
+
+    try {
+        $uri = [uri]$Url
+        if (-not $uri.IsAbsoluteUri -or $uri.Scheme -notmatch '^https?$') { return $false }
+
+        $path = $uri.AbsolutePath
+        if ([string]::IsNullOrWhiteSpace($path) -or $path.EndsWith('/')) { return $true }
+
+        $leaf = ($path -split '/')[-1]
+        if ([string]::IsNullOrWhiteSpace($leaf)) { return $true }
+
+        # Do not crawl obvious static/binary assets as pages. They may still be
+        # extracted and saved if they match SearchPattern; this only prevents
+        # wasting fetches on assets that will not contain useful outbound links.
+        if ($leaf -match '(?i)\.(?:css|js|mjs|json|xml|txt|csv|rss|atom|map|png|jpg|jpeg|gif|webp|svg|ico|bmp|avif|pdf|zip|7z|rar|tar|gz|tgz|bz2|xz|lha|lzh|exe|msi|dmg|pkg|deb|rpm|apk|ipa|mp3|ogg|wav|flac|mp4|webm|mov|avi|woff|woff2|ttf|otf|eot)$') {
+            return $false
+        }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-HostLooksInternalWithoutDns {
+    param([AllowNull()][string]$HostName)
+
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $true }
+
+    $hostClean = $HostName.Trim().Trim([char[]]@('[', ']')).TrimEnd('.').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($hostClean)) { return $true }
+    if ($hostClean -ieq 'localhost') { return $true }
+    if ($hostClean -notmatch '\.') { return $true }
+    if ($hostClean -match '(?i)(^|\.)(localhost|local|internal|lan)$' -or $hostClean -match '(?i)\.home\.arpa$') { return $true }
+
+    $parsedIp = [System.Net.IPAddress]::None
+    if ([System.Net.IPAddress]::TryParse($hostClean, [ref]$parsedIp)) {
+        return (Test-IsPrivateIPAddress -IPAddress $parsedIp)
+    }
+
+    return $false
+}
+
+function Test-UrlAllowedForFollow {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('SameDomain', 'SameHost', 'Any')]
+        [string]$Scope,
+
+        [Parameter(Mandatory = $true)]
+        $Boundary,
+
+        [ValidateSet('Any', 'SeedPath')]
+        [string]$PathScope = 'Any',
+
+        [bool]$AllowSubdomains = $false,
+        [int]$MaxSubdomainDepthValue = 0
+    )
+
+    $normalizedUrl = ConvertTo-NormalizedLink -Link $Url
+    if (-not $normalizedUrl) { return $false }
+    if (-not (Test-IsLikelyCrawlablePageUrl -Url $normalizedUrl)) { return $false }
+
+    $urlHost = Get-UrlHost -Url $normalizedUrl
+    if (-not $urlHost) { return $false }
+    if (Test-HostLooksInternalWithoutDns -HostName $urlHost) { return $false }
+
+    $allowedByScope = $false
+
+    if ($Scope -eq 'Any') {
+        $allowedByScope = $true
+    }
+    elseif ($Scope -eq 'SameHost') {
+        $allowedByScope = $Boundary.Hosts.Contains($urlHost)
+    }
+    else {
+        $rootDomain = Get-RegistrableDomain -HostName $urlHost
+        if ($rootDomain -and $Boundary.Domains.Contains($rootDomain)) {
+            # Default SameDomain policy: exact seed host(s), apex/root, and the common
+            # www.<root> host. Other subdomains are opt-in via -FollowSubdomains.
+            if ($Boundary.Hosts.Contains($urlHost) -or $urlHost -ieq $rootDomain -or $urlHost -ieq "www.$rootDomain") {
+                $allowedByScope = $true
+            }
+            elseif ($AllowSubdomains) {
+                $depth = Get-SubdomainDepthForRoot -HostName $urlHost -RootDomain $rootDomain
+                $allowedByScope = ($depth -ge 1 -and ($MaxSubdomainDepthValue -eq 0 -or $depth -le $MaxSubdomainDepthValue))
+            }
+        }
+    }
+
+    if (-not $allowedByScope) { return $false }
+
+    if ($PathScope -eq 'SeedPath') {
+        $allowedByPath = $false
+
+        foreach ($rule in @($Boundary.SeedPathRules)) {
+            if ($null -eq $rule) { continue }
+            if ([string]::IsNullOrWhiteSpace($rule.PathPrefix)) { continue }
+
+            $samePathBoundary = $false
+            if ($Scope -eq 'SameHost') {
+                $samePathBoundary = ($urlHost -ieq $rule.Host)
+            }
+            elseif ($Scope -eq 'SameDomain') {
+                $candidateRootDomain = Get-RegistrableDomain -HostName $urlHost
+                $samePathBoundary = (
+                    -not [string]::IsNullOrWhiteSpace($candidateRootDomain) -and
+                    -not [string]::IsNullOrWhiteSpace($rule.Domain) -and
+                    $candidateRootDomain -ieq $rule.Domain
+                )
+            }
+            else {
+                # In Any-domain mode, still bind SeedPath rules to the seed host.
+                # Otherwise a seed /1 path would accidentally allow /1 on every
+                # unrelated external site.
+                $samePathBoundary = ($urlHost -ieq $rule.Host)
+            }
+
+            if ($samePathBoundary -and (Test-UrlPathUnderPrefix -Url $normalizedUrl -PathPrefix $rule.PathPrefix)) {
+                $allowedByPath = $true
+                break
+            }
+        }
+
+        if (-not $allowedByPath) { return $false }
+    }
+
+    # Full DNS-based SSRF check is intentionally after scope filtering so an
+    # ordinary SameDomain crawl does not resolve every external link on the page.
+    return (-not (Test-IsPrivateUrl $normalizedUrl))
+}
+
 # ---------------------------------------------------------------------------
 # RESUME & PROGRESS HELPERS
 # Generates a fingerprint of the current run configuration to ensure a resumed
@@ -1686,6 +2174,8 @@ function Get-RunSignature {
         [string]$BlacklistScope,
         [string[]]$BlacklistPaths,
         [bool]$SecondFetch,
+        [bool]$EnforceRobotsTxt,
+        [string]$RobotsUserAgent,
         [bool]$KeepDuplicates,
         [bool]$NoDuplicates,
         [bool]$KeepFragments
@@ -1718,6 +2208,8 @@ function Get-RunSignature {
         "BlacklistScope=$BlacklistScope"
         "BlacklistPaths=$($blacklistSigPaths -join $delim)"
         "SecondFetch=$SecondFetch"
+        "EnforceRobotsTxt=$EnforceRobotsTxt"
+        "RobotsUserAgent=$RobotsUserAgent"
         "KeepDuplicates=$KeepDuplicates"
         "NoDuplicates=$NoDuplicates"
         "KeepFragments=$KeepFragments"
@@ -1749,7 +2241,7 @@ function Initialize-ProgressFile {
             Remove-Item -LiteralPath $Path -Force
 
             Set-Content -LiteralPath $Path -Value @(
-                "# Find-WebLinks progress file"
+                "# AE-Find-WebLinks progress file"
                 "# Signature: $Signature"
                 "# One completed source URL key per line"
             ) -Encoding UTF8
@@ -1770,7 +2262,7 @@ function Initialize-ProgressFile {
                         break
                     }
 
-                    # A valid Find-WebLinks progress file writes the signature near the top.
+                    # A valid AE-Find-WebLinks progress file writes the signature near the top.
                     # Do not scan a huge accidental file forever just because -Resume pointed at it.
                     if ($headerLinesChecked -ge 5) { break }
                 }
@@ -1809,7 +2301,7 @@ function Initialize-ProgressFile {
         }
 
         Set-Content -LiteralPath $Path -Value @(
-            "# Find-WebLinks progress file"
+            "# AE-Find-WebLinks progress file"
             "# Signature: $Signature"
             "# One completed source URL key per line"
         ) -Encoding UTF8
@@ -2982,7 +3474,12 @@ function Split-SrcsetValue {
 
 function Add-FoundLinkCandidate {
     param(
-        [Parameter(Mandatory=$true)]
+        # Empty lists are valid here: many pages call this before any previous
+        # extraction pass has added a URL. Keeping this non-mandatory avoids
+        # PowerShell rejecting an empty generic List before the first candidate
+        # can be appended.
+        [AllowNull()]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[string]]$List,
 
         [AllowNull()]
@@ -2990,6 +3487,10 @@ function Add-FoundLinkCandidate {
 
         [switch]$Srcset
     )
+
+    if ($null -eq $List) {
+        throw "Internal error: Add-FoundLinkCandidate was called without a target list."
+    }
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return }
 
@@ -3003,6 +3504,75 @@ function Add-FoundLinkCandidate {
     }
 
     [void]$List.Add($Value)
+}
+
+
+function Get-NormalizedUrlCandidatesFromText {
+    param(
+        [AllowNull()]
+        [string]$Text
+    )
+
+    # Source-list files are often copied from browser/dev-tool output, CSV/log
+    # files, or minified HTML. Treat each non-comment line as text and extract
+    # every URL-like value from it instead of assuming the whole line is exactly
+    # one URL. A plain one-URL-per-line file still works exactly as before.
+    $results = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    function Add-CandidateFromText {
+        param([AllowNull()][string]$CandidateText)
+
+        if ([string]::IsNullOrWhiteSpace($CandidateText)) { return }
+
+        $candidate = $CandidateText.Trim()
+        if ([string]::IsNullOrWhiteSpace($candidate)) { return }
+
+        # Trim separators commonly found in copied lists, CSV/TSV, Markdown,
+        # quoted strings, and logs. ConvertTo-NormalizedLink does its own URL
+        # cleanup too; this just improves multi-URL line extraction.
+        $candidate = $candidate.Trim([char[]]@(' ', "`t", '"', "'", '<', '>', '[', ']', '(', ')', '{', '}', ',', ';', '|'))
+        if ([string]::IsNullOrWhiteSpace($candidate)) { return }
+
+        $normalizedCandidate = ConvertTo-NormalizedLink -Link $candidate
+        if (-not $normalizedCandidate) { return }
+
+        $candidateKey = $normalizedCandidate
+        if ($seen.Add($candidateKey)) {
+            [void]$results.Add($normalizedCandidate)
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+
+    $lineText = $Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($lineText)) { return @() }
+
+    # Fast path: preserve old behaviour for a clean one-URL-per-line input file.
+    Add-CandidateFromText -CandidateText $lineText
+
+    # Also handle simple lists that use whitespace, comma, semicolon, or pipe as
+    # separators. This catches files where many URLs are on one physical line.
+    foreach ($token in ($lineText -split '[\s,;|]+')) {
+        Add-CandidateFromText -CandidateText $token
+    }
+
+    # Finally scan the whole line with the script's broad URL extractor so URLs
+    # embedded in HTML attributes, Markdown, logs, or CSV text are still found.
+    if ($null -ne $global:RegexRawUrl) {
+        foreach ($match in (Get-RegexMatchesSafe -Regex $global:RegexRawUrl -InputText $lineText -Name "source-list URL extraction")) {
+            $rawMatch = $match.Value
+
+            # RegexRawUrl is intentionally generous for page scraping. In list
+            # files that can make it capture "url1,url2" as one value, so split
+            # on common list separators before normalising.
+            foreach ($piece in ($rawMatch -split '[,;|]+')) {
+                Add-CandidateFromText -CandidateText $piece
+            }
+        }
+    }
+
+    return @($results.ToArray())
 }
 
 function New-FindWebLinksRequestSession {
@@ -3388,6 +3958,517 @@ function Get-ResponseContentLengthSafe {
     }
 }
 
+
+# ---------------------------------------------------------------------------
+# robots.txt helpers
+# ---------------------------------------------------------------------------
+# robots.txt enforcement is opt-in. Enabling it by default would change the
+# script's historical one-off extraction behaviour.
+#
+# This is a pragmatic RFC-style parser: User-agent groups, Allow, Disallow, '*'
+# wildcards, '$' end anchors, longest-rule precedence, and Allow winning ties.
+# Extensions such as Crawl-delay, Request-rate, and Sitemap are ignored; use
+# -DelaySeconds and conservative crawl depth/page caps for politeness.
+function Get-RobotsOriginKey {
+    param([AllowNull()][string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+
+    try {
+        $uri = [uri]$Url
+        if (-not $uri.IsAbsoluteUri -or $uri.Scheme -notmatch '^(?i)https?$') { return $null }
+        if ([string]::IsNullOrWhiteSpace($uri.Host)) { return $null }
+        return $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/').ToLowerInvariant()
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-RobotsTxtUrlForUrl {
+    param([AllowNull()][string]$Url)
+
+    $origin = Get-RobotsOriginKey -Url $Url
+    if (-not $origin) { return $null }
+    return "$origin/robots.txt"
+}
+
+function Get-RobotsPathAndQuery {
+    param([AllowNull()][string]$Url)
+
+    try {
+        $uri = [uri]$Url
+        if (-not $uri.IsAbsoluteUri) { return "/" }
+        if ([string]::IsNullOrWhiteSpace($uri.PathAndQuery)) { return "/" }
+        return $uri.PathAndQuery
+    }
+    catch {
+        return "/"
+    }
+}
+
+function New-RobotsPathRule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Allow', 'Disallow')]
+        [string]$Directive,
+
+        [AllowNull()]
+        [string]$Pattern
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Pattern)) { return $null }
+
+    $specificityText = $Pattern.Trim()
+    if ($specificityText.EndsWith('$')) {
+        $specificityText = $specificityText.Substring(0, $specificityText.Length - 1)
+    }
+
+    return [pscustomobject]@{
+        Directive   = $Directive
+        Pattern     = $Pattern.Trim()
+        Specificity = $specificityText.Replace('*', '').Length
+    }
+}
+
+function Add-RobotsGroupIfPresent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Groups,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$Agents,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Rules
+    )
+
+    if ($Agents.Count -eq 0) { return }
+
+    [void]$Groups.Add([pscustomobject]@{
+        Agents = @($Agents.ToArray())
+        Rules  = @($Rules.ToArray())
+    })
+}
+
+function ConvertFrom-RobotsTxt {
+    param([AllowNull()][string]$Text)
+
+    $groups = [System.Collections.Generic.List[object]]::new()
+    $agents = [System.Collections.Generic.List[string]]::new()
+    $rules = [System.Collections.Generic.List[object]]::new()
+    $seenRules = $false
+
+    foreach ($rawLine in ([string]$Text -split "`r?`n")) {
+        $line = if ($null -eq $rawLine) { "" } else { [string]$rawLine }
+        $hashIndex = $line.IndexOf('#')
+        if ($hashIndex -ge 0) { $line = $line.Substring(0, $hashIndex) }
+        $line = $line.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            Add-RobotsGroupIfPresent -Groups $groups -Agents $agents -Rules $rules
+            $agents = [System.Collections.Generic.List[string]]::new()
+            $rules = [System.Collections.Generic.List[object]]::new()
+            $seenRules = $false
+            continue
+        }
+
+        if ($line -notmatch '^([^:]+):(.*)$') { continue }
+        $field = $matches[1].Trim().ToLowerInvariant()
+        $value = $matches[2].Trim()
+
+        if ($field -eq 'user-agent') {
+            if ($seenRules) {
+                Add-RobotsGroupIfPresent -Groups $groups -Agents $agents -Rules $rules
+                $agents = [System.Collections.Generic.List[string]]::new()
+                $rules = [System.Collections.Generic.List[object]]::new()
+                $seenRules = $false
+            }
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                [void]$agents.Add($value.ToLowerInvariant())
+            }
+            continue
+        }
+
+        if ($field -eq 'allow' -or $field -eq 'disallow') {
+            if ($agents.Count -eq 0) { continue }
+            $seenRules = $true
+
+            # Empty Disallow means "allow all" for that directive; empty Allow is
+            # also a no-op for matching purposes.
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+
+            $directive = if ($field -eq 'allow') { 'Allow' } else { 'Disallow' }
+            $rule = New-RobotsPathRule -Directive $directive -Pattern $value
+            if ($null -ne $rule) { [void]$rules.Add($rule) }
+        }
+    }
+
+    Add-RobotsGroupIfPresent -Groups $groups -Agents $agents -Rules $rules
+    return @($groups.ToArray())
+}
+
+function Test-RobotsAgentMatches {
+    param(
+        [AllowNull()][string]$RobotsUserAgentValue,
+        [AllowNull()][string]$GroupAgent
+    )
+
+    if ([string]::IsNullOrWhiteSpace($GroupAgent)) { return $false }
+    $agent = $GroupAgent.Trim().ToLowerInvariant()
+    if ($agent -eq '*') { return $true }
+    if ([string]::IsNullOrWhiteSpace($RobotsUserAgentValue)) { return $false }
+    $robot = $RobotsUserAgentValue.Trim().ToLowerInvariant()
+
+    # Match against the configured product token. StartsWith covers cases like
+    # product token "Googlebot-News" matching a "googlebot" group.
+    return $robot.StartsWith($agent, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-RobotsApplicableRules {
+    param(
+        [AllowNull()][object[]]$Groups,
+        [AllowNull()][string]$RobotsUserAgentValue
+    )
+
+    $bestSpecificity = -1
+    $matchingGroups = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($group in @($Groups)) {
+        if ($null -eq $group) { continue }
+
+        $groupSpecificity = -1
+        foreach ($agent in @($group.Agents)) {
+            if (Test-RobotsAgentMatches -RobotsUserAgentValue $RobotsUserAgentValue -GroupAgent $agent) {
+                $agentText = ([string]$agent).Trim()
+                $specificity = if ($agentText -eq '*') { 0 } else { $agentText.Length }
+                if ($specificity -gt $groupSpecificity) { $groupSpecificity = $specificity }
+            }
+        }
+
+        if ($groupSpecificity -lt 0) { continue }
+
+        if ($groupSpecificity -gt $bestSpecificity) {
+            $matchingGroups.Clear()
+            $bestSpecificity = $groupSpecificity
+        }
+
+        if ($groupSpecificity -eq $bestSpecificity) {
+            [void]$matchingGroups.Add($group)
+        }
+    }
+
+    $rules = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in @($matchingGroups.ToArray())) {
+        foreach ($rule in @($group.Rules)) {
+            if ($null -ne $rule) { [void]$rules.Add($rule) }
+        }
+    }
+
+    return @($rules.ToArray())
+}
+
+function Test-RobotsPathMatchesPattern {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathAndQuery,
+        [AllowNull()][string]$Pattern
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Pattern)) { return $false }
+
+    $cleanPattern = $Pattern.Trim()
+    $anchorToEnd = $cleanPattern.EndsWith('$')
+    if ($anchorToEnd) {
+        $cleanPattern = $cleanPattern.Substring(0, $cleanPattern.Length - 1)
+    }
+    if ([string]::IsNullOrWhiteSpace($cleanPattern)) { return $false }
+
+    if ($cleanPattern.Contains('*')) {
+        $regexText = '^' + ([regex]::Escape($cleanPattern) -replace '\\\*', '.*')
+        if ($anchorToEnd) { $regexText += '$' }
+        try {
+            return [regex]::IsMatch($PathAndQuery, $regexText, [System.Text.RegularExpressions.RegexOptions]::CultureInvariant, $Script:RegexTimeout)
+        }
+        catch {
+            return $false
+        }
+    }
+
+    if ($anchorToEnd) {
+        return $PathAndQuery.Equals($cleanPattern, [System.StringComparison]::Ordinal)
+    }
+
+    return $PathAndQuery.StartsWith($cleanPattern, [System.StringComparison]::Ordinal)
+}
+
+function Test-RobotsPathAllowedByRules {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathAndQuery,
+        [AllowNull()][object[]]$Rules
+    )
+
+    $matches = [System.Collections.Generic.List[object]]::new()
+    foreach ($rule in @($Rules)) {
+        if ($null -eq $rule) { continue }
+        if (Test-RobotsPathMatchesPattern -PathAndQuery $PathAndQuery -Pattern ([string]$rule.Pattern)) {
+            [void]$matches.Add($rule)
+        }
+    }
+
+    if ($matches.Count -eq 0) { return $true }
+
+    $maxSpecificity = ($matches.ToArray() | ForEach-Object { [int]$_.Specificity } | Measure-Object -Maximum).Maximum
+    $bestRules = @($matches.ToArray() | Where-Object { [int]$_.Specificity -eq [int]$maxSpecificity })
+
+    # Allow wins ties.
+    foreach ($rule in $bestRules) {
+        if ([string]$rule.Directive -eq 'Allow') { return $true }
+    }
+
+    return $false
+}
+
+function New-RobotsPolicyObject {
+    param(
+        [Parameter(Mandatory = $true)][string]$OriginKey,
+        [Parameter(Mandatory = $true)][string]$RobotsUrl,
+        [Parameter(Mandatory = $true)][ValidateSet('ALLOW_ALL', 'RULES', 'UNAVAILABLE')][string]$Status,
+        [AllowNull()][object[]]$Rules = @(),
+        [AllowNull()][string]$Message = ""
+    )
+
+    return [pscustomobject]@{
+        OriginKey = $OriginKey
+        RobotsUrl = $RobotsUrl
+        Status    = $Status
+        Rules     = @($Rules)
+        Message   = $Message
+    }
+}
+
+function Get-RobotsHttpStatusFromErrorMessage {
+    param([AllowNull()][string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $null }
+    if ($Message -match '(?i)(HTTP|status code[^0-9]*:?\s*)\s*(?<code>\d{3})') {
+        $code = 0
+        if ([int]::TryParse($matches['code'].Value, [ref]$code)) { return $code }
+    }
+
+    return $null
+}
+
+function Get-RobotsPolicyForUrl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$RobotsUserAgentValue,
+        [Parameter(Mandatory = $true)][int]$MaxRetries,
+        [Parameter(Mandatory = $true)][int]$WaitSec,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [Parameter(Mandatory = $true)][string]$UserAgentString,
+        [AllowNull()][string]$ProxyUrl,
+        [Parameter(Mandatory = $true)][int]$MaxRedirectsCount,
+        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue
+    )
+
+    $originKey = Get-RobotsOriginKey -Url $Url
+    $robotsUrl = Get-RobotsTxtUrlForUrl -Url $Url
+
+    if (-not $originKey -or -not $robotsUrl) {
+        return (New-RobotsPolicyObject -OriginKey "" -RobotsUrl "" -Status "UNAVAILABLE" -Rules @() -Message "Could not determine robots.txt origin for URL: $Url")
+    }
+
+    if ($null -eq $Script:RobotsTxtCache) {
+        $Script:RobotsTxtCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+
+    $cached = $null
+    if ($Script:RobotsTxtCache.TryGetValue($originKey, [ref]$cached)) {
+        return $cached
+    }
+
+    $policy = $null
+    $response = $null
+
+    try {
+        Write-Host "  robots.txt: checking $robotsUrl"
+
+        $response = Invoke-WebRequestWithRetry `
+            -Url $robotsUrl `
+            -MaxRetries $MaxRetries `
+            -WaitSec $WaitSec `
+            -Timeout $TimeoutSec `
+            -DoSecondFetch $false `
+            -SecondWait 0 `
+            -UserAgentString $UserAgentString `
+            -ProxyUrl $ProxyUrl `
+            -MaxRedirectsCount $MaxRedirectsCount `
+            -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
+            -EnforceRobotsTxt $false `
+            -RobotsUserAgentValue $RobotsUserAgentValue
+
+        $robotsText = Get-ResponseContentText -Response $response -Context "robots.txt"
+        if ($Script:MaxRobotsTxtBytes -gt 0) {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($robotsText)
+            if ($bytes.Length -gt $Script:MaxRobotsTxtBytes) {
+                Write-Host "  robots.txt: larger than $([int]($Script:MaxRobotsTxtBytes / 1024)) KB; parsing only the first $([int]($Script:MaxRobotsTxtBytes / 1024)) KB."
+                $robotsText = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $Script:MaxRobotsTxtBytes)
+            }
+        }
+
+        $groups = @(ConvertFrom-RobotsTxt -Text $robotsText)
+        $rules = @(Get-RobotsApplicableRules -Groups $groups -RobotsUserAgentValue $RobotsUserAgentValue)
+
+        $policy = New-RobotsPolicyObject `
+            -OriginKey $originKey `
+            -RobotsUrl $robotsUrl `
+            -Status "RULES" `
+            -Rules $rules `
+            -Message "Loaded $($rules.Count) applicable robots.txt rule(s) for User-agent '$RobotsUserAgentValue'."
+
+        Write-Host "  robots.txt: loaded policy for $originKey ($($rules.Count) applicable rule(s))."
+    }
+    catch {
+        if (Test-IsCancellationException $_) { throw }
+
+        $message = $_.Exception.Message
+        $status = Get-RobotsHttpStatusFromErrorMessage -Message $message
+
+        if ($null -ne $status -and $status -ge 400 -and $status -lt 500) {
+            # Missing/unavailable robots.txt due to 4xx is treated as no restrictions.
+            $policy = New-RobotsPolicyObject `
+                -OriginKey $originKey `
+                -RobotsUrl $robotsUrl `
+                -Status "ALLOW_ALL" `
+                -Rules @() `
+                -Message "robots.txt returned HTTP $status; treating as no robots.txt restrictions."
+            Write-Host "  robots.txt: HTTP $status for $originKey; treating as no robots.txt restrictions."
+        }
+        else {
+            # Fail closed on server/network/DNS errors while enforcement is explicitly enabled.
+            $policy = New-RobotsPolicyObject `
+                -OriginKey $originKey `
+                -RobotsUrl $robotsUrl `
+                -Status "UNAVAILABLE" `
+                -Rules @() `
+                -Message "robots.txt unavailable for ${originKey}: $message"
+            Write-Host "  robots.txt: unavailable for $originKey; disallowing fetches for this origin while enforcement is enabled. $message"
+        }
+    }
+    finally {
+        if ($null -ne $response) { Close-BaseResponseSafe $response }
+    }
+
+    [void]$Script:RobotsTxtCache.TryAdd($originKey, $policy)
+    return $policy
+}
+
+function Test-RobotsTxtAllowed {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$RobotsUserAgentValue,
+        [Parameter(Mandatory = $true)][int]$MaxRetries,
+        [Parameter(Mandatory = $true)][int]$WaitSec,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [Parameter(Mandatory = $true)][string]$UserAgentString,
+        [AllowNull()][string]$ProxyUrl,
+        [Parameter(Mandatory = $true)][int]$MaxRedirectsCount,
+        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue
+    )
+
+    $normalizedUrl = ConvertTo-NormalizedLink -Link $Url
+    if (-not $normalizedUrl) {
+        return [pscustomobject]@{ Allowed = $false; Status = "INVALID"; Reason = "Invalid URL for robots.txt check: $Url" }
+    }
+
+    try {
+        $uri = [uri]$normalizedUrl
+        if ($uri.AbsolutePath -ieq '/robots.txt') {
+            return [pscustomobject]@{ Allowed = $true; Status = "ALLOW_ALL"; Reason = "robots.txt itself is allowed" }
+        }
+    }
+    catch { }
+
+    $policy = Get-RobotsPolicyForUrl `
+        -Url $normalizedUrl `
+        -RobotsUserAgentValue $RobotsUserAgentValue `
+        -MaxRetries $MaxRetries `
+        -WaitSec $WaitSec `
+        -TimeoutSec $TimeoutSec `
+        -UserAgentString $UserAgentString `
+        -ProxyUrl $ProxyUrl `
+        -MaxRedirectsCount $MaxRedirectsCount `
+        -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue
+
+    if ($policy.Status -eq "UNAVAILABLE") {
+        return [pscustomobject]@{ Allowed = $false; Status = "UNAVAILABLE"; Reason = $policy.Message }
+    }
+
+    if ($policy.Status -eq "ALLOW_ALL") {
+        return [pscustomobject]@{ Allowed = $true; Status = "ALLOW_ALL"; Reason = $policy.Message }
+    }
+
+    $pathAndQuery = Get-RobotsPathAndQuery -Url $normalizedUrl
+    $allowed = Test-RobotsPathAllowedByRules -PathAndQuery $pathAndQuery -Rules $policy.Rules
+    $reason = if ($allowed) { "Allowed by robots.txt for $pathAndQuery" } else { "Disallowed by robots.txt for $pathAndQuery" }
+
+    return [pscustomobject]@{ Allowed = $allowed; Status = "RULES"; Reason = $reason }
+}
+
+function Assert-RobotsTxtAllowsUrl {
+    param(
+        [bool]$Enabled,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Purpose,
+        [Parameter(Mandatory = $true)][string]$RobotsUserAgentValue,
+        [Parameter(Mandatory = $true)][int]$MaxRetries,
+        [Parameter(Mandatory = $true)][int]$WaitSec,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [Parameter(Mandatory = $true)][string]$UserAgentString,
+        [AllowNull()][string]$ProxyUrl,
+        [Parameter(Mandatory = $true)][int]$MaxRedirectsCount,
+        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue
+    )
+
+    if (-not $Enabled) { return }
+
+    $decision = Test-RobotsTxtAllowed `
+        -Url $Url `
+        -RobotsUserAgentValue $RobotsUserAgentValue `
+        -MaxRetries $MaxRetries `
+        -WaitSec $WaitSec `
+        -TimeoutSec $TimeoutSec `
+        -UserAgentString $UserAgentString `
+        -ProxyUrl $ProxyUrl `
+        -MaxRedirectsCount $MaxRedirectsCount `
+        -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue
+
+    if ($decision.Allowed) { return }
+
+    if ($decision.Status -eq "UNAVAILABLE") {
+        throw "ROBOTS_TXT_UNAVAILABLE: $($decision.Reason)"
+    }
+
+    throw "ROBOTS_TXT_BLOCKED: robots.txt disallows ${Purpose}: $Url -- $($decision.Reason)"
+}
+
+function Test-IsRobotsTxtBlockedError {
+    param([AllowNull()][object]$ErrorObject)
+
+    $message = if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) { $ErrorObject.Exception.Message } else { [string]$ErrorObject }
+    return ($message -match '^ROBOTS_TXT_BLOCKED:')
+}
+
+function Test-IsRobotsTxtUnavailableError {
+    param([AllowNull()][object]$ErrorObject)
+
+    $message = if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) { $ErrorObject.Exception.Message } else { [string]$ErrorObject }
+    return ($message -match '^ROBOTS_TXT_UNAVAILABLE:')
+}
+
 # ---------------------------------------------------------------------------
 # Function: Invoke-WebRequestWithRetry
 # Purpose: The core HTTP engine. Handles resilient fetching, parsing timeouts, 
@@ -3406,7 +4487,9 @@ function Invoke-WebRequestWithRetry {
         [AllowNull()]
         [string]$ProxyUrl,
         [int]$MaxRedirectsCount,
-        [int]$MaxRetryAfterSecondsValue
+        [int]$MaxRetryAfterSecondsValue,
+        [bool]$EnforceRobotsTxt = $false,
+        [string]$RobotsUserAgentValue = "AE-Find-WebLinks"
     )
 
     if ($Url -notmatch '^https?://') { $Url = "https://$Url" }
@@ -3436,6 +4519,19 @@ function Invoke-WebRequestWithRetry {
         if (Test-IsPrivateUrl $currentUrl) {
             throw "SSRF Blocked: URL targets a private/internal network ($currentUrl)."
         }
+
+        Assert-RobotsTxtAllowsUrl `
+            -Enabled $EnforceRobotsTxt `
+            -Url $currentUrl `
+            -Purpose "fetching" `
+            -RobotsUserAgentValue $RobotsUserAgentValue `
+            -MaxRetries $MaxRetries `
+            -WaitSec $WaitSec `
+            -TimeoutSec $Timeout `
+            -UserAgentString $UserAgentString `
+            -ProxyUrl $ProxyUrl `
+            -MaxRedirectsCount $MaxRedirectsCount `
+            -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue
 
         $lastError = $null
 
@@ -3594,7 +4690,7 @@ function Invoke-WebRequestWithRetry {
                 }
 
                 $attemptErrorMessage = $_.Exception.Message
-                if ($attemptErrorMessage -match '^(SSRF Blocked:|Too many HTTP redirects|Too many meta-refresh redirects|Invalid HTTP redirect target|HTTP redirect .* did not include a Location header|Invalid URL:)') {
+                if ($attemptErrorMessage -match '^(SSRF Blocked:|ROBOTS_TXT_BLOCKED:|ROBOTS_TXT_UNAVAILABLE:|Too many HTTP redirects|Too many meta-refresh redirects|Invalid HTTP redirect target|HTTP redirect .* did not include a Location header|Invalid URL:)') {
                     if ($null -ne $response) {
                         Close-BaseResponseSafe $response
                         $response = $null
@@ -3785,6 +4881,8 @@ function Get-LinksFromWebPage {
         [string]$ProxyUrl,
         [int]$MaxRedirectsCount,
         [int]$MaxRetryAfterSecondsValue,
+        [bool]$EnforceRobotsTxt = $false,
+        [string]$RobotsUserAgentValue = "AE-Find-WebLinks",
         [int64]$MaxPageContentBytesValue,
         [int]$MaxPageContentMBValue
     )
@@ -3804,7 +4902,9 @@ function Get-LinksFromWebPage {
             -UserAgentString $UserAgentString `
             -ProxyUrl $ProxyUrl `
             -MaxRedirectsCount $MaxRedirectsCount `
-            -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue
+            -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
+            -EnforceRobotsTxt $EnforceRobotsTxt `
+            -RobotsUserAgentValue $RobotsUserAgentValue
 
         # Force Content-Type to scalar and split comma-separated values.
         $contentType = Get-ResponseMediaType -Response $response
@@ -4300,6 +5400,29 @@ try {
         throw "-Resume is only useful with SourceType File."
     }
 
+    if ($Script:CrawlEnabled -and $Resume) {
+        throw "-Resume is not supported when crawl mode is enabled. A crawl needs to persist its frontier, not just completed source URLs. Re-run without -Resume, or use -FollowDepth 0 for resumable file-list processing."
+    }
+
+    if ($Script:CrawlEnabled -and $ThrottleLimit -gt 1) {
+        throw "Crawl mode currently requires -ThrottleLimit 1. Dynamic crawl frontiers are processed sequentially to keep depth, deduplication, and output writes deterministic."
+    }
+
+    if ((-not $Script:CrawlEnabled) -and $FollowPathScope -ne "Any") {
+        Write-Warning "-FollowPathScope is ignored when crawl mode is disabled (-FollowDepth 0)."
+    }
+
+    if ($EnforceRobotsTxt) {
+        if ([string]::IsNullOrWhiteSpace($RobotsUserAgent)) {
+            throw "-RobotsUserAgent cannot be empty when -EnforceRobotsTxt is used. Use a product token such as AE-Find-WebLinks."
+        }
+        $RobotsUserAgent = $RobotsUserAgent.Trim()
+
+        if ($ThrottleLimit -gt 1) {
+            throw "-EnforceRobotsTxt currently requires -ThrottleLimit 1. robots.txt decisions are cached and applied deterministically only in sequential mode."
+        }
+    }
+
     if ($ThrottleLimit -gt 1) {
         if ($SourceType -ne "File") {
             throw "-ThrottleLimit > 1 is only useful with SourceType File."
@@ -4311,7 +5434,9 @@ try {
     }
 
     # Assign default progress file early so collision checks also cover it.
-    if ($SourceType -eq "File" -and [string]::IsNullOrWhiteSpace($ProgressFile)) {
+    # Crawl mode does not support resume/frontier persistence yet, so do not
+    # create or require a progress file only when crawl mode is disabled.
+    if ($SourceType -eq "File" -and (-not $Script:CrawlEnabled) -and [string]::IsNullOrWhiteSpace($ProgressFile)) {
         $ProgressFile = "$OutputFile.progress"
     }
 
@@ -4319,6 +5444,7 @@ try {
     # This must happen before output/log files are created or overwritten.
     if (
         $SourceType -eq "File" -and
+        (-not $Script:CrawlEnabled) -and
         $ProgressFile -and
         (Test-Path -LiteralPath $ProgressFile) -and
         -not $Resume
@@ -4630,6 +5756,8 @@ try {
         -BlacklistScope $BlacklistScope `
         -BlacklistPaths $BlacklistFile `
         -SecondFetch $SecondFetch `
+        -EnforceRobotsTxt ([bool]$EnforceRobotsTxt) `
+        -RobotsUserAgent $RobotsUserAgent `
         -KeepDuplicates $KeepDuplicates `
         -NoDuplicates $NoDuplicates `
         -KeepFragments $KeepFragments
@@ -4741,6 +5869,24 @@ try {
         Write-Host "Exclude pattern(s): $($effectiveExcludePatterns -join ', ')"
         Write-Host "Exclude mode: $ExcludeMode"
     }
+    if ($Script:CrawlEnabled) {
+        $subdomainText = if ($FollowSubdomains) {
+            if ($MaxSubdomainDepth -eq 0) { "enabled, unlimited subdomain depth" } else { "enabled, max subdomain depth $MaxSubdomainDepth" }
+        }
+        else {
+            "disabled except seed/apex/www hosts"
+        }
+        $capText = if ($MaxFollowPages -eq 0) { "no page cap" } else { "max $MaxFollowPages fetched page(s)" }
+        $pathScopeText = if ($FollowPathScope -eq "SeedPath") { "seed URL path subtree" } else { "any allowed path" }
+        Write-Host "Crawl enabled: FollowDepth=$($Script:FollowDepthDisplay), FollowScope=$FollowScope, FollowPathScope=$FollowPathScope, path=$pathScopeText, subdomains=$subdomainText, $capText."
+        Write-Host "Crawl discovery ignores SearchPattern; SearchPattern only controls what is written."
+        if ($Script:FollowDepthUnlimited -and $MaxFollowPages -eq 0) {
+            Write-Warning "Unbounded crawl requested: unlimited depth and no MaxFollowPages cap. The crawl will stop only when the allowed frontier is exhausted or the run is interrupted."
+        }
+    }
+    if ($EnforceRobotsTxt) {
+        Write-Host "robots.txt enforcement enabled. User-agent token: $RobotsUserAgent."
+    }
 
 
     $totalWritten        = 0
@@ -4751,6 +5897,7 @@ try {
     $totalBlacklistOut   = 0
     $totalDupes          = 0
     $totalFailed         = 0
+    $totalRobotsBlocked  = 0
 
     # Helper: write one row to the CSV log
     function Write-LogCsvRow {
@@ -4835,7 +5982,315 @@ try {
         return ($message -match '^(Output write failed|Progress write failed)')
     }
 
-    if ($SourceType -eq "Url") {
+    function Invoke-UrlFetchAndMatch {
+        param(
+            [Parameter(Mandatory = $true)][string]$Url,
+            [int]$Depth = 0
+        )
+
+        try {
+            $links = @(Get-LinksFromWebPage `
+                -PageUrl $Url `
+                -MaxRetries $RetryCount `
+                -WaitSec $WaitSeconds `
+                -TimeoutSec $TimeoutSeconds `
+                -DoSecondFetch ([bool]$SecondFetch) `
+                -SecondWaitSec $SecondFetchWait `
+                -UserAgentString $UserAgent `
+                -ProxyUrl $Proxy `
+                -MaxRedirectsCount $Script:MaxRedirects `
+                -MaxRetryAfterSecondsValue $Script:MaxRetryAfterSeconds `
+                -EnforceRobotsTxt ([bool]$EnforceRobotsTxt) `
+                -RobotsUserAgentValue $RobotsUserAgent `
+                -MaxPageContentBytesValue $Script:MaxPageContentBytes `
+                -MaxPageContentMBValue $Script:MaxPageContentMB)
+
+            $stats = Write-MatchedLinks -Links $links -RegexList $searchRegexList `
+                        -SearchMode $SearchMode `
+                        -ExcludeRegexList $excludeRegexList -ExcludeMode $ExcludeMode `
+                        -OutFile $OutputFile -WrittenSet $writtenSet `
+                        -BlacklistSet $blacklistSet `
+                        -BlacklistScope $BlacklistScope `
+                        -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments)
+
+            return [pscustomobject]@{
+                Url            = $Url
+                Depth          = $Depth
+                Status         = "OK"
+                Links          = $links
+                ExtractedCount = $links.Count
+                Stats          = $stats
+                ErrorMsg       = ""
+            }
+        }
+        catch {
+            if (Test-IsCancellationException $_) { throw }
+            if (Test-IsFatalProcessingError $_) { throw }
+
+            $status = if (Test-IsRobotsTxtBlockedError $_) {
+                "ROBOTS_BLOCKED"
+            }
+            elseif (Test-IsRobotsTxtUnavailableError $_) {
+                "ROBOTS_UNAVAILABLE"
+            }
+            else {
+                "FAILED"
+            }
+
+            return [pscustomobject]@{
+                Url            = $Url
+                Depth          = $Depth
+                Status         = $status
+                Links          = @()
+                ExtractedCount = 0
+                Stats          = $null
+                ErrorMsg       = $_.Exception.Message
+            }
+        }
+    }
+
+    function Invoke-CrawlSequential {
+        param(
+            [Parameter(Mandatory = $true)][string[]]$SeedUrls,
+            [switch]$SingleSeedMode
+        )
+
+        $boundary = New-FollowBoundary -SeedUrls $SeedUrls
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $scheduled = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $initialSkipped = 0
+
+        foreach ($seedUrl in @($SeedUrls)) {
+            if ([string]::IsNullOrWhiteSpace($seedUrl)) { continue }
+
+            $normalizedSeed = ConvertTo-NormalizedLink -Link $seedUrl
+            if (-not $normalizedSeed) { continue }
+            if (Test-IsPrivateUrl $normalizedSeed) { continue }
+
+            if ((Test-BlacklistAppliesToInput -Scope $BlacklistScope) -and (Test-IsBlacklisted -Url $normalizedSeed -BlacklistSet $blacklistSet -KeepFragments $KeepFragments)) {
+                $initialSkipped++
+                Write-Host "Source URL is blacklisted. Skipping: $normalizedSeed"
+                Write-LogCsvRow -Url $normalizedSeed -Status "BLACKLISTED_SOURCE" `
+                    -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 1 -Duplicates 0 `
+                    -Written 0 -ErrorMsg ""
+                continue
+            }
+
+            if ($MaxFollowPages -gt 0 -and $scheduled.Count -ge $MaxFollowPages) {
+                Write-Host "Crawl page cap reached while scheduling seeds ($MaxFollowPages); remaining seeds will not be queued."
+                break
+            }
+
+            $seedKey = Get-LinkKey -Link $normalizedSeed -KeepFragments:$false
+            if ($scheduled.Add($seedKey)) {
+                $queue.Enqueue([pscustomobject]@{ Url = $normalizedSeed; Depth = 0 })
+            }
+        }
+
+        $script:totalBlacklistSrc += $initialSkipped
+
+        if ($queue.Count -eq 0) {
+            if ($initialSkipped -gt 0) {
+                Write-Host "No URLs left to fetch after source blacklist filtering."
+                return
+            }
+
+            throw "No crawl seed URLs available after validation and filtering."
+        }
+
+        Write-Host "Crawl seed URL(s): $($queue.Count)"
+        if ($FollowPathScope -eq 'SeedPath') {
+            Write-Host "Crawl boundary hosts: $($boundary.Hosts.Count); root domain(s): $($boundary.Domains.Count); seed path boundary/boundaries: $($boundary.SeedPathRules.Count)"
+        }
+        else {
+            Write-Host "Crawl boundary hosts: $($boundary.Hosts.Count); root domain(s): $($boundary.Domains.Count)"
+        }
+
+        $fetchIndex = 0
+        while ($queue.Count -gt 0) {
+            $item = $queue.Dequeue()
+            $fetchIndex++
+
+            Write-Host "[$fetchIndex] Fetching depth $($item.Depth)/$($Script:FollowDepthDisplay): $($item.Url)"
+            $result = Invoke-UrlFetchAndMatch -Url $item.Url -Depth ([int]$item.Depth)
+
+            if ($result.Status -eq "OK") {
+                $links = @($result.Links)
+                $stats = $result.Stats
+
+                $script:totalExtracted += $result.ExtractedCount
+                $script:totalMatched += $stats.Matched
+                $script:totalExcluded += $stats.Excluded
+                $script:totalBlacklistOut += $stats.Blacklisted
+                $script:totalDupes += $stats.Duplicates
+                $script:totalWritten += $stats.Written
+
+                Write-Host "  Extracted $($result.ExtractedCount) link(s)."
+                Write-Host "  Matched: $($stats.Matched) | Excluded: $($stats.Excluded) | Blacklisted: $($stats.Blacklisted) | Duplicates: $($stats.Duplicates) | Written: $($stats.Written)"
+
+                Write-LogCsvRow -Url $item.Url -Status "OK" `
+                    -Extracted $result.ExtractedCount -Matched $stats.Matched `
+                    -Excluded $stats.Excluded -Blacklisted $stats.Blacklisted -Duplicates $stats.Duplicates `
+                    -Written $stats.Written -ErrorMsg ""
+
+                if ($Script:FollowDepthUnlimited -or [int]$item.Depth -lt $FollowDepth) {
+                    $enqueuedThisPage = 0
+                    foreach ($candidate in $links) {
+                        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+
+                        $candidateUrl = ConvertTo-NormalizedLink -Link $candidate
+                        if (-not $candidateUrl) { continue }
+
+                        if (-not (Test-UrlAllowedForFollow `
+                            -Url $candidateUrl `
+                            -Scope $FollowScope `
+                            -Boundary $boundary `
+                            -PathScope $FollowPathScope `
+                            -AllowSubdomains ([bool]$FollowSubdomains) `
+                            -MaxSubdomainDepthValue $MaxSubdomainDepth)) {
+                            continue
+                        }
+
+                        if ((Test-BlacklistAppliesToInput -Scope $BlacklistScope) -and (Test-IsBlacklisted -Url $candidateUrl -BlacklistSet $blacklistSet -KeepFragments $KeepFragments)) {
+                            continue
+                        }
+
+                        if ($MaxFollowPages -gt 0 -and $scheduled.Count -ge $MaxFollowPages) {
+                            continue
+                        }
+
+                        $candidateKey = Get-LinkKey -Link $candidateUrl -KeepFragments:$false
+                        if ($scheduled.Add($candidateKey)) {
+                            $queue.Enqueue([pscustomobject]@{ Url = $candidateUrl; Depth = ([int]$item.Depth + 1) })
+                            $enqueuedThisPage++
+                        }
+                    }
+
+                    if ($enqueuedThisPage -gt 0) {
+                        Write-Host "  Enqueued $enqueuedThisPage crawl candidate(s) for next depth. Queue: $($queue.Count). Scheduled total: $($scheduled.Count)."
+                    }
+                    elseif ($MaxFollowPages -gt 0 -and $scheduled.Count -ge $MaxFollowPages) {
+                        Write-Host "  Crawl page cap reached ($MaxFollowPages); no more candidates will be queued."
+                    }
+                }
+            }
+            elseif ($result.Status -eq "ROBOTS_BLOCKED") {
+                $script:totalRobotsBlocked++
+                $robotsMessage = if ([string]::IsNullOrWhiteSpace($result.ErrorMsg)) { "Blocked by robots.txt" } else { $result.ErrorMsg }
+                Write-Host "  ROBOTS: $robotsMessage"
+                Write-Host "  Skipping this URL and continuing."
+
+                Write-LogCsvRow -Url $item.Url -Status "ROBOTS_BLOCKED" `
+                    -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                    -Written 0 -ErrorMsg $robotsMessage
+            }
+            else {
+                $script:totalFailed++
+                $errorMessage = if ([string]::IsNullOrWhiteSpace($result.ErrorMsg)) { "Unknown Network Error" } else { $result.ErrorMsg }
+                if ($result.Status -eq "ROBOTS_UNAVAILABLE") {
+                    Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
+                }
+                else {
+                    Write-Host "  FAILED: $errorMessage"
+                }
+                Write-Host "  Skipping this URL and continuing."
+
+                Write-LogCsvRow -Url $item.Url -Status $result.Status `
+                    -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                    -Written 0 -ErrorMsg $errorMessage
+
+                Write-FailedUrlRow -Url $item.Url -ErrorMsg $errorMessage
+            }
+
+            if ($queue.Count -gt 0 -and $DelaySeconds -gt 0) {
+                Write-Host "  Waiting $DelaySeconds second(s) before next URL ..."
+                Start-Sleep -Seconds $DelaySeconds
+            }
+
+            Write-Host ""
+        }
+    }
+
+    if ($Script:CrawlEnabled) {
+        if ($SourceType -eq "Url") {
+            Invoke-CrawlSequential -SeedUrls @($validatedSingleSourceUrl) -SingleSeedMode
+        }
+        elseif ($SourceType -eq "File") {
+            Write-Host "Reading crawl seed URLs from file: $Source"
+
+            if (-not (Test-Path -LiteralPath $Source)) {
+                throw "Input file does not exist: $Source"
+            }
+
+            $sourceSafePath = Get-SafeAbsolutePath $Source
+            $seedUrls = [System.Collections.Generic.List[string]]::new()
+            $seenSeedUrls = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $dupeSeedCount = 0
+            $invalidSeedCount = 0
+            $privateSeedCount = 0
+            $isFirstSeedLine = $true
+
+            $fs = $null
+            $reader = $null
+            try {
+                $fs = [System.IO.FileStream]::new($sourceSafePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $reader = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8)
+
+                while ($null -ne ($line = $reader.ReadLine())) {
+                    if ($isFirstSeedLine) { $line = Remove-Bom $line; $isFirstSeedLine = $false }
+                    if ([string]::IsNullOrWhiteSpace($line) -or $line.Trim().StartsWith("#")) { continue }
+
+                    $lineSeedCandidates = @(Get-NormalizedUrlCandidatesFromText -Text $line)
+                    if ($lineSeedCandidates.Count -gt 0) {
+                        foreach ($normalized in $lineSeedCandidates) {
+                            if (Test-IsPrivateUrl $normalized) {
+                                Write-Host "  Skipping private/internal seed URL: $normalized"
+                                $privateSeedCount++
+                                continue
+                            }
+
+                            $key = Get-LinkKey -Link $normalized -KeepFragments:$false
+                            if ($seenSeedUrls.Add($key)) {
+                                [void]$seedUrls.Add($normalized)
+                            }
+                            else {
+                                $dupeSeedCount++
+                            }
+                        }
+                    }
+                    else {
+                        $invalidSeedCount++
+                    }
+                }
+            }
+            catch {
+                throw "Failed to read input file: $($_.Exception.Message)"
+            }
+            finally {
+                if ($null -ne $reader) {
+                    $reader.Dispose()
+                }
+                elseif ($null -ne $fs) {
+                    $fs.Dispose()
+                }
+            }
+
+            Write-Host "Valid unique crawl seed URLs: $($seedUrls.Count)"
+            if ($dupeSeedCount -gt 0) { Write-Host "Removed $dupeSeedCount duplicate seed URL(s)." }
+            if ($invalidSeedCount -gt 0) { Write-Host "Skipped $invalidSeedCount line(s) with no valid web seed URL." }
+            if ($privateSeedCount -gt 0) { Write-Host "Skipped $privateSeedCount private/internal seed URL(s)." }
+
+            if ($seedUrls.Count -eq 0) {
+                throw "No valid crawl seed URLs found in input file."
+            }
+
+            Invoke-CrawlSequential -SeedUrls ([string[]]$seedUrls.ToArray())
+        }
+        else {
+            throw "Unsupported SourceType: $SourceType"
+        }
+    }
+    elseif ($SourceType -eq "Url") {
         # Single URL mode -- fetch, filter, write. Source was already validated
         # before output/log files were created, so reuse that normalized value.
         $sourceUrl = $validatedSingleSourceUrl
@@ -4862,6 +6317,8 @@ try {
                     -ProxyUrl $Proxy `
                     -MaxRedirectsCount $Script:MaxRedirects `
                     -MaxRetryAfterSecondsValue $Script:MaxRetryAfterSeconds `
+                    -EnforceRobotsTxt ([bool]$EnforceRobotsTxt) `
+                    -RobotsUserAgentValue $RobotsUserAgent `
                     -MaxPageContentBytesValue $Script:MaxPageContentBytes `
                     -MaxPageContentMBValue $Script:MaxPageContentMB)
                 $totalExtracted = $links.Count
@@ -4891,15 +6348,31 @@ try {
                 if (Test-IsCancellationException $_) { throw }
                 if (Test-IsFatalProcessingError $_) { throw }
 
-                $totalFailed++
                 $errorMessage = $_.Exception.Message
-                Write-Host "  FAILED: $errorMessage"
+                if (Test-IsRobotsTxtBlockedError $_) {
+                    $totalRobotsBlocked++
+                    Write-Host "  ROBOTS: $errorMessage"
+                    Write-LogCsvRow -Url $sourceUrl -Status "ROBOTS_BLOCKED" `
+                        -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                        -Written 0 -ErrorMsg $errorMessage
+                }
+                else {
+                    $totalFailed++
+                    if (Test-IsRobotsTxtUnavailableError $_) {
+                        Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
+                        $logStatus = "ROBOTS_UNAVAILABLE"
+                    }
+                    else {
+                        Write-Host "  FAILED: $errorMessage"
+                        $logStatus = "FAILED"
+                    }
 
-                Write-LogCsvRow -Url $sourceUrl -Status "FAILED" `
-                    -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                    -Written 0 -ErrorMsg $errorMessage
+                    Write-LogCsvRow -Url $sourceUrl -Status $logStatus `
+                        -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                        -Written 0 -ErrorMsg $errorMessage
 
-                Write-FailedUrlRow -Url $sourceUrl -ErrorMsg $errorMessage
+                    Write-FailedUrlRow -Url $sourceUrl -ErrorMsg $errorMessage
+                }
             }
         }
     }
@@ -4935,20 +6408,22 @@ try {
                 if ($isFirstLine) { $line = Remove-Bom $line; $isFirstLine = $false }
                 if ([string]::IsNullOrWhiteSpace($line) -or $line.Trim().StartsWith("#")) { continue }
 
-                $normalized = ConvertTo-NormalizedLink -Link $line
-                if ($normalized) {
-                    # #36: Skip private/internal URLs (SSRF protection)
-                    if (Test-IsPrivateUrl $normalized) {
-                        Write-Host "  Skipping private/internal URL: $normalized"
-                        $privateSourceCount++
-                        continue
-                    }
-                    $key = Get-LinkKey -Link $normalized -KeepFragments $KeepFragments
-                    if ($seenSourceUrls.Add($key)) {
-                        [void]$urls.Add($normalized)
-                    }
-                    else {
-                        $dupeSourceCount++
+                $lineSourceCandidates = @(Get-NormalizedUrlCandidatesFromText -Text $line)
+                if ($lineSourceCandidates.Count -gt 0) {
+                    foreach ($normalized in $lineSourceCandidates) {
+                        # #36: Skip private/internal URLs (SSRF protection)
+                        if (Test-IsPrivateUrl $normalized) {
+                            Write-Host "  Skipping private/internal URL: $normalized"
+                            $privateSourceCount++
+                            continue
+                        }
+                        $key = Get-LinkKey -Link $normalized -KeepFragments $KeepFragments
+                        if ($seenSourceUrls.Add($key)) {
+                            [void]$urls.Add($normalized)
+                        }
+                        else {
+                            $dupeSourceCount++
+                        }
                     }
                 }
                 else {
@@ -4973,7 +6448,7 @@ try {
             Write-Host "Removed $dupeSourceCount duplicate source URL(s)."
         }
         if ($invalidSourceCount -gt 0) {
-            Write-Host "Skipped $invalidSourceCount invalid/non-web source line(s)."
+            Write-Host "Skipped $invalidSourceCount line(s) with no valid web source URL."
         }
         if ($privateSourceCount -gt 0) {
             Write-Host "Skipped $privateSourceCount private/internal source URL(s)."
@@ -5073,6 +6548,12 @@ try {
                 $funcNames = @(
                     'Get-LinkKey', 'Test-IsLikelyRelativeAssetPath', 'Limit-NormalizedLinkLength', 'ConvertTo-NormalizedLink',
                     'ConvertFrom-JsUrl', 'Invoke-WebRequestWithRetry',
+                    'Get-RobotsOriginKey', 'Get-RobotsTxtUrlForUrl', 'Get-RobotsPathAndQuery',
+                    'New-RobotsPathRule', 'Add-RobotsGroupIfPresent', 'ConvertFrom-RobotsTxt',
+                    'Test-RobotsAgentMatches', 'Get-RobotsApplicableRules', 'Test-RobotsPathMatchesPattern',
+                    'Test-RobotsPathAllowedByRules', 'New-RobotsPolicyObject', 'Get-RobotsHttpStatusFromErrorMessage',
+                    'Get-RobotsPolicyForUrl', 'Test-RobotsTxtAllowed', 'Assert-RobotsTxtAllowsUrl',
+                    'Test-IsRobotsTxtBlockedError', 'Test-IsRobotsTxtUnavailableError',
                     'Get-LinksFromWebPage', 'Close-BaseResponseSafe',
                     'Test-IsCancellationException', 'Test-IsInvalidWebRequestStateError',
                     'Test-IsPrivateIPAddress', 'Test-IsPrivateUrl', 'Resolve-SearchEngineLink',
@@ -5115,6 +6596,9 @@ try {
                         MaxRetryAfterSeconds = $Script:MaxRetryAfterSeconds
                         MaxPageContentMB = $Script:MaxPageContentMB
                         MaxPageContentBytes = $Script:MaxPageContentBytes
+                        EnforceRobotsTxt = [bool]$EnforceRobotsTxt
+                        RobotsUserAgent = $RobotsUserAgent
+                        MaxRobotsTxtBytes = $Script:MaxRobotsTxtBytes
                         RegexTimeoutSeconds = $RegexTimeoutSeconds
                         DnsResolutionTimeoutSeconds = $Script:DnsResolutionTimeoutSeconds
                     }
@@ -5127,6 +6611,8 @@ try {
                     $Script:MaxRetryAfterSeconds = $_.MaxRetryAfterSeconds
                     $Script:MaxPageContentBytes = $_.MaxPageContentBytes
                     $Script:MaxPageContentMB = $_.MaxPageContentMB
+                    $Script:MaxRobotsTxtBytes = $_.MaxRobotsTxtBytes
+                    $Script:RobotsTxtCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
                     $Script:DnsResolutionTimeoutSeconds = $_.DnsResolutionTimeoutSeconds
                     $Script:RegexTimeout = if ($_.RegexTimeoutSeconds -eq 0) {
                         [System.Text.RegularExpressions.Regex]::InfiniteMatchTimeout
@@ -5188,6 +6674,8 @@ try {
                             -ProxyUrl $_.Proxy `
                             -MaxRedirectsCount $_.MaxRedirects `
                             -MaxRetryAfterSecondsValue $_.MaxRetryAfterSeconds `
+                            -EnforceRobotsTxt ([bool]$_.EnforceRobotsTxt) `
+                            -RobotsUserAgentValue $_.RobotsUserAgent `
                             -MaxPageContentBytesValue $_.MaxPageContentBytes `
                             -MaxPageContentMBValue $_.MaxPageContentMB)
                         Write-Host "[parallel] OK: $url -- Extracted $($links.Count) link(s)"
@@ -5203,13 +6691,31 @@ try {
                     catch {
                         if (Test-IsCancellationException $_) { throw }
 
-                        Write-Host "[parallel] FAILED: $url -- $($_.Exception.Message)"
+                        $status = if (Test-IsRobotsTxtBlockedError $_) {
+                            "ROBOTS_BLOCKED"
+                        }
+                        elseif (Test-IsRobotsTxtUnavailableError $_) {
+                            "ROBOTS_UNAVAILABLE"
+                        }
+                        else {
+                            "FAILED"
+                        }
+
+                        if ($status -eq "ROBOTS_BLOCKED") {
+                            Write-Host "[parallel] ROBOTS: $url -- $($_.Exception.Message)"
+                        }
+                        elseif ($status -eq "ROBOTS_UNAVAILABLE") {
+                            Write-Host "[parallel] ROBOTS UNAVAILABLE: $url -- $($_.Exception.Message)"
+                        }
+                        else {
+                            Write-Host "[parallel] FAILED: $url -- $($_.Exception.Message)"
+                        }
 
                         [pscustomobject]@{
                             Url            = $url
                             Links          = @()
                             ExtractedCount = 0
-                            Status         = "FAILED"
+                            Status         = $status
                             ErrorMsg       = $_.Exception.Message
                         }
                     }
@@ -5304,6 +6810,8 @@ try {
                             -ProxyUrl $Proxy `
                             -MaxRedirectsCount $Script:MaxRedirects `
                             -MaxRetryAfterSecondsValue $Script:MaxRetryAfterSeconds `
+                            -EnforceRobotsTxt ([bool]$EnforceRobotsTxt) `
+                            -RobotsUserAgentValue $RobotsUserAgent `
                             -MaxPageContentBytesValue $Script:MaxPageContentBytes `
                             -MaxPageContentMBValue $Script:MaxPageContentMB)
                         $totalExtracted += $links.Count
@@ -5335,17 +6843,35 @@ try {
                         if (Test-IsCancellationException $_) { throw }
                         if (Test-IsFatalProcessingError $_) { throw }
 
-                        $totalFailed++
                         $errorMessage = $_.Exception.Message
 
-                        Write-Host "  FAILED: $errorMessage"
-                        Write-Host "  Skipping this URL and continuing."
+                        if (Test-IsRobotsTxtBlockedError $_) {
+                            $totalRobotsBlocked++
+                            Write-Host "  ROBOTS: $errorMessage"
+                            Write-Host "  Skipping this URL and continuing."
 
-                        Write-LogCsvRow -Url $url -Status "FAILED" `
-                            -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                            -Written 0 -ErrorMsg $errorMessage
+                            Write-LogCsvRow -Url $url -Status "ROBOTS_BLOCKED" `
+                                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                                -Written 0 -ErrorMsg $errorMessage
+                        }
+                        else {
+                            $totalFailed++
+                            if (Test-IsRobotsTxtUnavailableError $_) {
+                                Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
+                                $logStatus = "ROBOTS_UNAVAILABLE"
+                            }
+                            else {
+                                Write-Host "  FAILED: $errorMessage"
+                                $logStatus = "FAILED"
+                            }
+                            Write-Host "  Skipping this URL and continuing."
 
-                        Write-FailedUrlRow -Url $url -ErrorMsg $errorMessage
+                            Write-LogCsvRow -Url $url -Status $logStatus `
+                                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                                -Written 0 -ErrorMsg $errorMessage
+
+                            Write-FailedUrlRow -Url $url -ErrorMsg $errorMessage
+                        }
                     }
 
                     if ($markProgressForUrl -and $ProgressFile -and $completedSourceSet) {
@@ -5373,7 +6899,7 @@ try {
 
     # Clean up progress file only after a fully successful completed run.
     # If any URL failed, keep the progress file so -Resume can retry only the unfinished/failed URLs.
-    if ($SourceType -eq "File" -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
+    if ($SourceType -eq "File" -and (-not $Script:CrawlEnabled) -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
         if ($totalFailed -eq 0) {
             Remove-ProgressFileIfSafe `
                 -Path $ProgressFile `
@@ -5407,12 +6933,19 @@ try {
     Write-Host "Total excluded pattern(s):   $totalExcluded"
     Write-Host "Total blacklisted (source):  $totalBlacklistSrc"
     Write-Host "Total blacklisted (output):  $totalBlacklistOut"
+    Write-Host "Total robots.txt blocked:    $totalRobotsBlocked"
     Write-Host "Total duplicates:            $totalDupes"
     Write-Host "Total written to file:       $totalWritten"
     Write-Host "Total failed URLs:           $totalFailed"
+    Write-Host "robots.txt enforced:         $EnforceRobotsTxt"
+    if ($Script:CrawlEnabled) {
+        Write-Host "Crawl follow depth:          $($Script:FollowDepthDisplay)"
+        Write-Host "Crawl scope:                 $FollowScope"
+        Write-Host "Crawl path scope:            $FollowPathScope"
+    }
 
     # #46: Warn if failure rate is suspiciously high
-    if ($HighFailureRatePercent -gt 0 -and $SourceType -eq "File" -and $totalFailed -gt 0 -and $urls.Count -gt 0) {
+    if ($HighFailureRatePercent -gt 0 -and (-not $Script:CrawlEnabled) -and $SourceType -eq "File" -and $totalFailed -gt 0 -and $urls.Count -gt 0) {
         $failRate = [Math]::Round(($totalFailed / $urls.Count) * 100, 1)
         if ($failRate -ge $HighFailureRatePercent) {
             Write-Host "WARNING: High failure rate ($failRate%). Threshold: $HighFailureRatePercent%. Check your source URLs or network."
