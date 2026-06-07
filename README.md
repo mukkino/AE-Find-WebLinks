@@ -20,15 +20,15 @@ By default, AE-Find-WebLinks still scans only the source URL or URLs you provide
 
 This version adds:
 
-* Optional crawl depth control.
-* Optional crawl-until-exhausted mode.
-* Same-host and same-domain crawl boundaries.
-* Optional subdomain crawling.
-* Optional seed-path/subtree crawling.
-* Crawl page safety caps.
-* Optional `robots.txt` enforcement, disabled by default.
-* Better source-file URL extraction.
-* Fixes for crawl seed handling, empty-link collections, PowerShell parser edge cases, and reserved PowerShell variable collisions.
+- Optional crawl depth control.
+- Optional crawl-until-exhausted mode.
+- Same-host and same-domain crawl boundaries.
+- Optional subdomain crawling.
+- Optional seed-path/subtree crawling.
+- Crawl page safety caps.
+- Optional `robots.txt` enforcement, disabled by default.
+- Better source-file URL extraction.
+- Fixes for crawl seed handling, empty-link collections, PowerShell parser edge cases, and reserved PowerShell variable collisions.
 
 Use this version if you want the original one-page extraction behaviour, or if you need controlled recursive crawling for archive discovery, download-list generation, or path-limited link discovery.
 
@@ -36,10 +36,10 @@ Use this version if you want the original one-page extraction behaviour, or if y
 
 ## Requirements
 
-* Windows PowerShell 5.1 or PowerShell 7+.
-* PowerShell 7+ is required only when using parallel processing with `-ThrottleLimit` greater than `1`.
-* No external PowerShell modules required.
-* No browser required.
+- Windows PowerShell 5.1 or PowerShell 7+.
+- PowerShell 7+ is required only when using parallel processing with `-ThrottleLimit` greater than `1`.
+- No external PowerShell modules required.
+- No browser required.
 
 Crawl mode is intentionally sequential in this version. If crawling is enabled, use `-ThrottleLimit 1`.
 
@@ -49,41 +49,41 @@ Crawl mode is intentionally sequential in this version. If crawling is enabled, 
 
 AE-Find-WebLinks can:
 
-* Scan one URL.
-* Scan many URLs from a text file.
-* Extract links from raw HTTP responses.
-* Extract URL tokens from less-clean source files, including copied text, logs, CSV-style lines, and HTML-like content.
-* Match links using one wildcard pattern or multiple wildcard patterns.
-* Use `Any` or `All` matching logic for include patterns.
-* Exclude links using one or more wildcard patterns.
-* Use `Any` or `All` matching logic for exclusion patterns.
-* Write matching links to a plain text output file.
-* Append to an existing output file or create a fresh output file.
-* Avoid writing duplicate links already present in the output file.
-* Optionally keep duplicate matches found within the same page.
-* Preserve or ignore URL fragments during deduplication.
-* Use one or more exact-URL blacklist files.
-* Apply blacklists to input URLs, output links, or both.
-* Resume interrupted non-crawl file-mode runs using a progress file.
-* Detect changed run settings before resuming.
-* Retry failed requests.
-* Honour HTTP and meta-refresh redirect limits.
-* Optionally fetch a page twice and keep the larger response.
-* Use a custom User-Agent.
-* Use an HTTP proxy.
-* Log per-URL processing statistics to CSV.
-* Save failed source URLs to a separate tab-separated file.
-* Use independent append/new modes for output, CSV log, and failed URL files.
-* Process URL lists sequentially or, outside crawl mode, in parallel.
-* Deduplicate and sort files before or after a scraping run.
-* Clean failed or stale maintenance temporary files created by deduplication and sorting.
-* Run standalone maintenance commands without fetching URLs.
-* Protect against dangerous file collisions.
-* Warn when failure rates are high.
-* Expose operational limits as command-line parameters instead of hardcoded values.
-* Show built-in help with `-Help` or `-h`.
-* Start a guided interactive command builder with `-InteractiveHelp` or `-Interactive`.
-* When started without parameters, ask whether to show help, open the guided command builder, or exit.
+- Scan one URL.
+- Scan many URLs from a text file.
+- Extract links from raw HTTP responses.
+- Extract URL tokens from less-clean source files, including copied text, logs, CSV-style lines, and HTML-like content.
+- Match links using one wildcard pattern or multiple wildcard patterns.
+- Use `Any` or `All` matching logic for include patterns.
+- Exclude links using one or more wildcard patterns.
+- Use `Any` or `All` matching logic for exclusion patterns.
+- Write matching links to a plain text output file.
+- Append to an existing output file or create a fresh output file.
+- Avoid writing duplicate links already present in the output file.
+- Optionally keep duplicate matches found within the same page.
+- Preserve or ignore URL fragments during deduplication.
+- Use one or more exact-URL blacklist files.
+- Apply blacklists to input URLs, output links, or both.
+- Resume interrupted non-crawl file-mode runs using a progress file.
+- Detect changed run settings before resuming.
+- Retry failed requests.
+- Honour HTTP and meta-refresh redirect limits.
+- Optionally fetch a page twice and keep the larger response.
+- Use a custom User-Agent.
+- Use an HTTP proxy.
+- Log per-URL processing statistics to CSV.
+- Save failed source URLs to a separate tab-separated file.
+- Use independent append/new modes for output, CSV log, and failed URL files.
+- Process URL lists sequentially or, outside crawl mode, in parallel.
+- Deduplicate and sort files before or after a scraping run.
+- Clean failed or stale maintenance temporary files created by deduplication and sorting.
+- Run standalone maintenance commands without fetching URLs.
+- Protect against dangerous file collisions.
+- Warn when failure rates are high.
+- Expose operational limits as command-line parameters instead of hardcoded values.
+- Show built-in help with `-Help` or `-h`.
+- Start a guided interactive command builder with `-InteractiveHelp` or `-Interactive`.
+- When started without parameters, ask whether to show help, open the guided command builder, or exit.
 
 ---
 
@@ -102,7 +102,7 @@ Crawl discovery intentionally ignores `SearchPattern`. This is important because
 
 For example, if you search for:
 
-```powershell
+```text
 "*news*story*"
 ```
 
@@ -359,9 +359,9 @@ Set the user-agent token used for robots matching with:
 
 When enabled, the script checks `robots.txt` before fetching:
 
-* initial source URLs;
-* crawled pages;
-* redirect targets.
+- initial source URLs;
+- crawled pages;
+- redirect targets.
 
 The script caches `robots.txt` rules per origin to avoid repeatedly downloading the same file.
 
@@ -369,13 +369,13 @@ Missing or `4xx` `robots.txt` responses are treated as allowed. Network errors o
 
 Supported robots rules include:
 
-* `User-agent`
-* `Allow`
-* `Disallow`
-* `*` wildcards
-* `$` end anchors
-* longest-match rule selection
-* `Allow` winning ties
+- `User-agent`
+- `Allow`
+- `Disallow`
+- `*` wildcards
+- `$` end anchors
+- longest-match rule selection
+- `Allow` winning ties
 
 Unsupported extensions such as `Crawl-delay`, `Sitemap`, and `Request-rate` are ignored.
 
@@ -388,37 +388,37 @@ Use `-DelaySeconds` for throttling.
 ### Scan one page only
 
 ```powershell
-.\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New
+& ".\AE-Find-WebLinks.ps1" "https://example.com" "*download*" ".\matched-links.txt" New
 ```
 
 ### Scan many source URLs from a file
 
 ```powershell
-.\AE-Find-WebLinks.ps1 ".\source-urls.txt" "*download*" ".\matched-links.txt" New File
+& ".\AE-Find-WebLinks.ps1" ".\source-urls.txt" "*download*" ".\matched-links.txt" New File
 ```
 
 ### Crawl one level on the same domain
 
 ```powershell
-.\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 1 -FollowScope SameDomain
+& ".\AE-Find-WebLinks.ps1" "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 1 -FollowScope SameDomain
 ```
 
 ### Crawl until exhausted inside the same path subtree
 
 ```powershell
-.\AE-Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0
+& ".\AE-Find-WebLinks.ps1" ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0
 ```
 
 ### Same command, but with a safety cap
 
 ```powershell
-.\AE-Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
+& ".\AE-Find-WebLinks.ps1" ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
 ```
 
 ### Enable robots.txt enforcement
 
 ```powershell
-.\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 2 -FollowScope SameDomain -EnforceRobotsTxt
+& ".\AE-Find-WebLinks.ps1" "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 2 -FollowScope SameDomain -EnforceRobotsTxt
 ```
 
 ---
@@ -429,13 +429,13 @@ AE-Find-WebLinks is not a browser.
 
 It does not:
 
-* execute JavaScript;
-* click buttons;
-* scroll pages;
-* log in to websites;
-* solve captchas;
-* render dynamic pages;
-* discover links created only after browser-side JavaScript execution.
+- execute JavaScript;
+- click buttons;
+- scroll pages;
+- log in to websites;
+- solve captchas;
+- render dynamic pages;
+- discover links created only after browser-side JavaScript execution.
 
 It works best on links present in the raw HTTP response, including HTML, text, CSS, script text, JSON-like payloads, and embedded URL patterns.
 
