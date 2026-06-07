@@ -406,13 +406,13 @@ Use `-DelaySeconds` for throttling.
 ### Crawl until exhausted inside the same path subtree
 
 ```powershell
-.\Find-WebLinks.ps1 ".\download-now2.txt" "*comic*picture*" ".\matched-links2.txt" Append File -BlacklistFile ".\already-dowloaded2.txt" -LogCsv ".\run-log2.csv" -FailedUrlFile ".\failed-urls2.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0
+.\Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0
 ```
 
 ### Same command, but with a safety cap
 
 ```powershell
-.\Find-WebLinks.ps1 ".\download-now2.txt" "*comic*picture*" ".\matched-links2.txt" Append File -BlacklistFile ".\already-dowloaded2.txt" -LogCsv ".\run-log2.csv" -FailedUrlFile ".\failed-urls2.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
+.\Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
 ```
 
 ### Enable robots.txt enforcement
