@@ -388,37 +388,37 @@ Use `-DelaySeconds` for throttling.
 ### Scan one page only
 
 ```powershell
-& ".\AE-Find-WebLinks.ps1" "https://example.com" "*download*" ".\matched-links.txt" New
+.\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New
 ```
 
 ### Scan many source URLs from a file
 
 ```powershell
-& ".\AE-Find-WebLinks.ps1" ".\source-urls.txt" "*download*" ".\matched-links.txt" New File
+.\AE-Find-WebLinks.ps1 ".\source-urls.txt" "*download*" ".\matched-links.txt" New File
 ```
 
 ### Crawl one level on the same domain
 
 ```powershell
-& ".\AE-Find-WebLinks.ps1" "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 1 -FollowScope SameDomain
+.\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 1 -FollowScope SameDomain
 ```
 
 ### Crawl until exhausted inside the same path subtree
 
 ```powershell
-& ".\AE-Find-WebLinks.ps1" ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0
+.\AE-Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0
 ```
 
 ### Same command, but with a safety cap
 
 ```powershell
-& ".\AE-Find-WebLinks.ps1" ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
+.\AE-Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
 ```
 
 ### Enable robots.txt enforcement
 
 ```powershell
-& ".\AE-Find-WebLinks.ps1" "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 2 -FollowScope SameDomain -EnforceRobotsTxt
+.\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 2 -FollowScope SameDomain -EnforceRobotsTxt
 ```
 
 ---
