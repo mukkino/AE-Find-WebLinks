@@ -114,25 +114,25 @@ the crawler may still follow pages that do not contain `news` or `story` in the 
 
 Use `-FollowDepth` to decide how far links should be followed.
 
-```powershell
+```text
 -FollowDepth 0
 ```
 
 Default behaviour. No crawling. Only the supplied source URL or URLs are scanned.
 
-```powershell
+```text
 -FollowDepth 1
 ```
 
 Scan the source page, then fetch links found on that page.
 
-```powershell
+```text
 -FollowDepth 2
 ```
 
 Scan the source page, fetch links found on that page, then fetch links found one level deeper.
 
-```powershell
+```text
 -FollowDepth -1
 ```
 
@@ -140,13 +140,13 @@ Crawl until there are no more allowed unseen links.
 
 The clearer equivalent is:
 
-```powershell
+```text
 -FollowUntilExhausted
 ```
 
 Aliases are also available:
 
-```powershell
+```text
 -FollowToEnd
 -UnlimitedFollowDepth
 ```
@@ -159,7 +159,7 @@ Use `-MaxFollowPages` to limit how many pages the crawler is allowed to schedule
 
 Default:
 
-```powershell
+```text
 -MaxFollowPages 1000
 ```
 
@@ -167,7 +167,7 @@ This prevents accidental huge crawls.
 
 To remove the cap:
 
-```powershell
+```text
 -MaxFollowPages 0
 ```
 
@@ -181,7 +181,7 @@ Use `-FollowScope` to control which hosts or domains may be crawled.
 
 Available values:
 
-```powershell
+```text
 -FollowScope SameDomain
 -FollowScope SameHost
 -FollowScope Any
@@ -189,7 +189,7 @@ Available values:
 
 Default:
 
-```powershell
+```text
 -FollowScope SameDomain
 ```
 
@@ -259,13 +259,13 @@ By default, subdomain crawling is disabled except for the seed host, apex host, 
 
 Enable wider subdomain crawling with:
 
-```powershell
+```text
 -FollowSubdomains
 ```
 
 Limit how many subdomain levels may be followed with:
 
-```powershell
+```text
 -MaxSubdomainDepth 1
 ```
 
@@ -288,7 +288,7 @@ a.b.c.example.com
 
 Default:
 
-```powershell
+```text
 -FollowSubdomains:$false
 -MaxSubdomainDepth 1
 ```
@@ -311,7 +311,7 @@ https://example.com/1
 
 With:
 
-```powershell
+```text
 -FollowPathScope SeedPath
 ```
 
@@ -335,7 +335,7 @@ The path check is segment-aware, so `/1` does not accidentally match `/10`.
 
 Default:
 
-```powershell
+```text
 -FollowPathScope Any
 ```
 
@@ -347,13 +347,13 @@ AE-Find-WebLinks can enforce `robots.txt`, but this is disabled by default.
 
 Enable it with:
 
-```powershell
+```text
 -EnforceRobotsTxt
 ```
 
 Set the user-agent token used for robots matching with:
 
-```powershell
+```text
 -RobotsUserAgent "AE-Find-WebLinks"
 ```
 
@@ -387,37 +387,37 @@ Use `-DelaySeconds` for throttling.
 
 ### Scan one page only
 
-```powershell
+```text
 .\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New
 ```
 
 ### Scan many source URLs from a file
 
-```powershell
+```text
 .\AE-Find-WebLinks.ps1 ".\source-urls.txt" "*download*" ".\matched-links.txt" New File
 ```
 
 ### Crawl one level on the same domain
 
-```powershell
+```text
 .\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 1 -FollowScope SameDomain
 ```
 
 ### Crawl until exhausted inside the same path subtree
 
-```powershell
+```text
 .\AE-Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0
 ```
 
 ### Same command, but with a safety cap
 
-```powershell
+```text
 .\AE-Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
 ```
 
 ### Enable robots.txt enforcement
 
-```powershell
+```text
 .\AE-Find-WebLinks.ps1 "https://example.com" "*download*" ".\matched-links.txt" New -FollowDepth 2 -FollowScope SameDomain -EnforceRobotsTxt
 ```
 
@@ -447,7 +447,7 @@ For JavaScript-rendered websites, use a browser-based crawler instead, or provid
 
 For most archive or download-list jobs, start with:
 
-```powershell
+```text
 -FollowScope SameHost
 -FollowPathScope SeedPath
 -MaxFollowPages 5000
@@ -457,7 +457,7 @@ Then only loosen the settings if needed.
 
 Use:
 
-```powershell
+```text
 -FollowScope SameDomain
 ```
 
@@ -465,7 +465,7 @@ when the site legitimately moves between `example.com` and `www.example.com`.
 
 Use:
 
-```powershell
+```text
 -FollowSubdomains
 ```
 
@@ -473,7 +473,7 @@ only when the target archive is known to span subdomains.
 
 Use:
 
-```powershell
+```text
 -MaxFollowPages 0
 ```
 
