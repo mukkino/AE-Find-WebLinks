@@ -12,9 +12,9 @@ It is a raw-response extraction and crawling tool, not a browser. It does **not*
 
 ## Current version
 
-**Latest version:** `1.7.6`
+**Latest version:** `1.7.0`
 
-Version `1.7.6` adds controlled crawling and link-following support while preserving the old default behaviour.
+Version `1.7.0` adds controlled crawling and link-following support while preserving the old default behaviour.
 
 By default, Find-WebLinks still scans only the source URL or URLs you provide. Crawling is disabled unless explicitly enabled with `-FollowDepth`, `-FollowUntilExhausted`, `-FollowToEnd`, or `-UnlimitedFollowDepth`.
 
