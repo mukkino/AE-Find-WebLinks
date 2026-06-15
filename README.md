@@ -12,14 +12,17 @@ It is a raw-response extraction and crawling tool, not a browser. It does **not*
 
 ## Current version
 
-**Latest version:** `1.7.0`
+**Latest version:** `1.7.1`
 
-Version `1.7.0` adds controlled crawling and link-following support while preserving the old default behaviour.
+Version `1.7.1` adds optional regex-based link evaluation stripping. This lets the script remove a regex-matched part of an extracted link before matching, exclusion checks, output blacklist checks, output deduplication, and writing. For example, links ending in `/1`, `/2`, `/10`, or `/111` can be evaluated and saved as the same base URL by using `-StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'`.
+
+Version `1.7.0` added controlled crawling and link-following support while preserving the old default behaviour.
 
 By default, AE-Find-WebLinks still scans only the source URL or URLs you provide. Crawling is disabled unless explicitly enabled with `-FollowDepth`, `-FollowUntilExhausted`, `-FollowToEnd`, or `-UnlimitedFollowDepth`.
 
 This version adds:
 
+- Optional regex stripping before link evaluation and output writing.
 - Optional crawl depth control.
 - Optional crawl-until-exhausted mode.
 - Same-host and same-domain crawl boundaries.
@@ -62,6 +65,7 @@ AE-Find-WebLinks can:
 - Avoid writing duplicate links already present in the output file.
 - Optionally keep duplicate matches found within the same page.
 - Preserve or ignore URL fragments during deduplication.
+- Optionally remove a regex-matched part from extracted links before matching, output deduplication, blacklist checks, and writing.
 - Use one or more exact-URL blacklist files.
 - Apply blacklists to input URLs, output links, or both.
 - Resume interrupted non-crawl file-mode runs using a progress file.
@@ -341,6 +345,45 @@ Default:
 
 ---
 
+## Regex stripping before link evaluation
+
+Use `-StripRegexBeforeEvaluation` with `-LinkEvaluationStripRegex` when links contain a trailing part that should be ignored for matching and saving.
+
+This is not the same as `-ExcludePattern`. `-ExcludePattern` rejects a link. Regex stripping keeps the link, removes the regex-matched part from the evaluated form, and then uses that evaluated form for:
+
+- search pattern matching;
+- exclude pattern checks;
+- output blacklist checks;
+- duplicate checks against the output file;
+- the value written to the output file.
+
+Example links:
+
+```text
+https://example.example.org/example/example/1
+https://example.example.org/example/example/2
+https://example.example.org/example/example/10
+https://example.example.org/example/example/111
+```
+
+Command option:
+
+```text
+-StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'
+```
+
+Evaluated and written as:
+
+```text
+https://example.example.org/example/example
+```
+
+Use an anchored regex when you only want to remove the final part. For example, `/\d+$` removes only a final slash followed by digits. A broader regex will remove whatever it matches.
+
+When crawl mode uses `-FollowPathScope SeedPath`, the seed path boundary is also built from the evaluated seed URL. That means a seed such as `https://example.example.org/example/example/1` uses `/example/example` as the path boundary when the regex above is enabled.
+
+---
+
 ## robots.txt support
 
 AE-Find-WebLinks can enforce `robots.txt`, but this is disabled by default.
@@ -413,6 +456,26 @@ Use `-DelaySeconds` for throttling.
 
 ```text
 .\AE-Find-WebLinks.ps1 ".\download-now.txt" "*news*story*" ".\matched-links.txt" Append File -BlacklistFile ".\already-dowloaded.txt" -LogCsv ".\run-log.csv" -FailedUrlFile ".\failed-urls.txt" -DeduplicateFiles -SortOutput:$true -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 5000
+```
+
+### Strip a numeric final path segment before evaluation
+
+```text
+.\AE-Find-WebLinks.ps1 "https://example.com" "*example/example*" ".\matched-links.txt" New -StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'
+```
+
+With that option, extracted links such as:
+
+```text
+https://example.example.org/example/example/1
+https://example.example.org/example/example/2
+https://example.example.org/example/example/10
+```
+
+are evaluated and written as:
+
+```text
+https://example.example.org/example/example
 ```
 
 ### Enable robots.txt enforcement
