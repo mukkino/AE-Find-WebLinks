@@ -1,6 +1,6 @@
 #requires -Version 5.1
 
-# AE-Find-WebLinks.ps1 - 1.7.0
+# AE-Find-WebLinks.ps1 - 1.7.1
 # Author: Fabio Lichinchi (mukka)
 # Site: alterego.cc
 # 
@@ -217,6 +217,17 @@ param(
     # Include #anchor fragments when considering uniqueness
     [Parameter(Mandatory = $false)]
     [switch]$KeepFragments,
+
+    # Removes regex-matched text from extracted links before matching, exclude checks,
+    # output blacklist checks, output deduplication, and writing. Example regex: '/\d+$'
+    [Parameter(Mandatory = $false)]
+    [Alias("UseEvaluationStripRegex", "EnableEvaluationStripRegex")]
+    [switch]$StripRegexBeforeEvaluation,
+
+    # Regex removed when -StripRegexBeforeEvaluation is enabled.
+    [Parameter(Mandatory = $false)]
+    [Alias("EvaluationStripRegex", "LinkEvaluationRegex", "IgnoreRegexForEvaluation")]
+    [string]$LinkEvaluationStripRegex,
 
     [Parameter(Mandatory = $false)]
     [string]$Proxy,
@@ -483,6 +494,38 @@ else {
     [TimeSpan]::FromSeconds($RegexTimeoutSeconds)
 }
 
+# Optional URL evaluation cleanup. This is not an exclude filter: it creates a
+# temporary/evaluated form of each extracted link by removing a regex match before
+# search matching, exclude matching, output blacklist checks, output deduplication,
+# and output writing. The actual fetched source/crawl URL is not rewritten.
+[bool]$Script:StripRegexBeforeEvaluation = $false
+[string]$Script:LinkEvaluationStripRegexText = $null
+$Script:LinkEvaluationStripRegexObject = $null
+[bool]$Script:LinkEvaluationStripRegexWarned = $false
+
+if (-not $Script:SkipOperationalValidation) {
+    if ((-not [bool]$StripRegexBeforeEvaluation) -and -not [string]::IsNullOrWhiteSpace($LinkEvaluationStripRegex)) {
+        Write-Warning "-LinkEvaluationStripRegex was supplied without -StripRegexBeforeEvaluation; enabling regex stripping before link evaluation."
+        $StripRegexBeforeEvaluation = $true
+    }
+
+    if ([bool]$StripRegexBeforeEvaluation) {
+        if ([string]::IsNullOrWhiteSpace($LinkEvaluationStripRegex)) {
+            throw "-StripRegexBeforeEvaluation requires -LinkEvaluationStripRegex. Example: -StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'"
+        }
+
+        try {
+            $evaluationRegexOptions = [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+            $Script:LinkEvaluationStripRegexObject = [regex]::new($LinkEvaluationStripRegex, $evaluationRegexOptions, $Script:RegexTimeout)
+            $Script:LinkEvaluationStripRegexText = $LinkEvaluationStripRegex
+            $Script:StripRegexBeforeEvaluation = $true
+        }
+        catch {
+            throw "Invalid -LinkEvaluationStripRegex '$LinkEvaluationStripRegex': $($_.Exception.Message)"
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Function: Show-Usage
 # Purpose: Prints the help menu to the console.
@@ -518,6 +561,8 @@ function Show-Usage {
     Write-Host "  -ExcludePattern <pattern>  Main wildcard pattern to exclude from matched links."
     Write-Host "  -ExcludePatterns <p1>,<p2> One or more wildcard patterns to exclude from matched links."
     Write-Host "  -ExcludeMode <Any|All>     Any = exclude if any exclude pattern hits (default). All = exclude only if every exclude pattern hits."
+    Write-Host "  -StripRegexBeforeEvaluation  Remove a regex match from links before matching/output/dedup."
+    Write-Host "  -LinkEvaluationStripRegex <regex> Regex used by -StripRegexBeforeEvaluation. Example: '/\d+$'"
     Write-Host ""
     Write-Host "Mode (optional, default: Append):"
     Write-Host "  New       Create or overwrite the output file, then write matched links."
@@ -564,6 +609,8 @@ function Show-Usage {
     Write-Host "  -ThrottleLimit <n>        Process n URLs in parallel (default: 1 = sequential). Requires PS 7+"
     Write-Host "  -DeduplicateFiles         Legacy: deduplicate source, output, and blacklist files before starting"
     Write-Host "  -KeepFragments            Preserve URL fragments (#...) for deduplication (useful for SPAs)"
+    Write-Host "  -StripRegexBeforeEvaluation  Strip regex matches from links before search/exclude/output evaluation"
+    Write-Host "  -LinkEvaluationStripRegex <regex> Regex removed before evaluation. Example: '/\d+$' strips a numeric final path segment"
     Write-Host "  -UserAgent <string>       Custom User-Agent header (default: Chrome 131)"
     Write-Host "  -Proxy <url>              HTTP proxy URL (e.g. http://proxy:8080)"
     Write-Host "  -SortOutput <bool>        Legacy: sort the output file alphabetically after the run (default: false)"
@@ -1107,6 +1154,13 @@ function Edit-RunOptionalSettings {
                 }
 
                 Set-OptionalSwitchValue -Settings $Settings -Name "KeepFragments" -Prompt "Keep URL fragments (#...) when deduplicating?" -Default $false
+
+                $stripEvaluationRegex = Read-InteractiveYesNo -Prompt "Strip a regex-matched part from extracted links before matching/output/deduplication?" -Default $false
+                if ($stripEvaluationRegex) {
+                    $Settings["StripRegexBeforeEvaluation"] = $true
+                    $stripRegexValue = Read-InteractiveText -Prompt "Regex to remove from links before evaluation. Example: /\d+$" -Required
+                    $Settings["LinkEvaluationStripRegex"] = $stripRegexValue
+                }
             }
 
             "Retry, network, proxy, and fetching" {
@@ -1237,7 +1291,7 @@ function New-RunCommandFromInteractiveAnswers {
     # Append standard string settings
     foreach ($name in @(
         "BlacklistScope", "FollowScope", "FollowPathScope", "LogMode", "FailedUrlMode", "SortDirection", "DeduplicateWhen", "SortWhen",
-        "Proxy", "UserAgent", "RobotsUserAgent", "ProgressFile", "LogCsv", "FailedUrlFile"
+        "Proxy", "UserAgent", "RobotsUserAgent", "ProgressFile", "LogCsv", "FailedUrlFile", "LinkEvaluationStripRegex"
     )) {
         if ($Settings.ContainsKey($name)) {
             Add-CommandValue -Parts $parts -Name $name -Value $Settings[$name]
@@ -1273,7 +1327,7 @@ function New-RunCommandFromInteractiveAnswers {
 
     # Append Switch settings
     foreach ($name in @(
-        "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments", "EnforceRobotsTxt", "FollowUntilExhausted",
+        "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments", "StripRegexBeforeEvaluation", "EnforceRobotsTxt", "FollowUntilExhausted",
         "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues"
     )) {
         if ($Settings.ContainsKey($name)) {
@@ -1630,6 +1684,43 @@ function Convert-WildcardToRegex {
     return "^$regex$"
 }
 
+function Get-LinkEvaluationValue {
+    param([AllowNull()][string]$Link)
+
+    if ([string]::IsNullOrWhiteSpace($Link)) { return $Link }
+    if (-not $Script:StripRegexBeforeEvaluation -or $null -eq $Script:LinkEvaluationStripRegexObject) { return $Link }
+
+    $candidate = $Link.Trim()
+
+    try {
+        $candidate = $Script:LinkEvaluationStripRegexObject.Replace($candidate, "")
+    }
+    catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {
+        if (-not $Script:LinkEvaluationStripRegexWarned) {
+            Write-Host "  WARNING: Link evaluation strip regex timed out; continuing with original link values."
+            $Script:LinkEvaluationStripRegexWarned = $true
+        }
+        return $Link
+    }
+
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $Link }
+
+    # If the stripped value is still a valid URL, return its normalized form so
+    # matching/dedup/output compare a stable URL. If the user's regex produces a
+    # non-URL string, still return the stripped text for wildcard matching.
+    try {
+        $normalized = ConvertTo-NormalizedLink -Link $candidate
+        if (-not [string]::IsNullOrWhiteSpace($normalized)) {
+            return $normalized
+        }
+    }
+    catch {
+        # Fall back to the stripped string below.
+    }
+
+    return $candidate.Trim()
+}
+
 function Get-EffectiveSearchPatterns {
     param(
         [AllowNull()]
@@ -1686,14 +1777,18 @@ function Test-LinkMatchesSearch {
     param(
         [string]$Link,
         [string[]]$RegexList,
-        [string]$Mode
+        [string]$Mode,
+        [bool]$UseEvaluationValue = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($Link)) { return $false }
 
+    $linkToEvaluate = if ($UseEvaluationValue) { Get-LinkEvaluationValue -Link $Link } else { $Link }
+    if ([string]::IsNullOrWhiteSpace($linkToEvaluate)) { return $false }
+
     if ($Mode -eq "All") {
         foreach ($regex in $RegexList) {
-            if ($Link -notmatch $regex) {
+            if ($linkToEvaluate -notmatch $regex) {
                 return $false
             }
         }
@@ -1701,7 +1796,7 @@ function Test-LinkMatchesSearch {
     }
 
     foreach ($regex in $RegexList) {
-        if ($Link -match $regex) {
+        if ($linkToEvaluate -match $regex) {
             return $true
         }
     }
@@ -1713,11 +1808,12 @@ function Test-LinkMatchesExclude {
     param(
         [string]$Link,
         [string[]]$RegexList,
-        [string]$Mode
+        [string]$Mode,
+        [bool]$UseEvaluationValue = $false
     )
 
     if ($null -eq $RegexList -or $RegexList.Count -eq 0) { return $false }
-    return (Test-LinkMatchesSearch -Link $Link -RegexList $RegexList -Mode $Mode)
+    return (Test-LinkMatchesSearch -Link $Link -RegexList $RegexList -Mode $Mode -UseEvaluationValue $UseEvaluationValue)
 }
 
 # ---------------------------------------------------------------------------
@@ -1729,10 +1825,18 @@ function Test-LinkMatchesExclude {
 function Get-LinkKey {
     param(
         [string]$Link,
-        [bool]$KeepFragments = $false
+        [bool]$KeepFragments = $false,
+        [bool]$UseEvaluationValue = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($Link)) { return "" }
+
+    if ($UseEvaluationValue) {
+        $evaluatedLink = Get-LinkEvaluationValue -Link $Link
+        if (-not [string]::IsNullOrWhiteSpace($evaluatedLink)) {
+            $Link = $evaluatedLink
+        }
+    }
 
     # Guard against absurdly long strings that would spike CPU in URI parsing
     if ($Script:MaxUrlLength -gt 0 -and $Link.Length -gt $Script:MaxUrlLength) {
@@ -1781,10 +1885,18 @@ function Get-LinkKey {
 function Get-LinkWriteValue {
     param(
         [string]$Link,
-        [bool]$KeepFragments = $false
+        [bool]$KeepFragments = $false,
+        [bool]$UseEvaluationValue = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($Link)) { return "" }
+
+    if ($UseEvaluationValue) {
+        $evaluatedLink = Get-LinkEvaluationValue -Link $Link
+        if (-not [string]::IsNullOrWhiteSpace($evaluatedLink)) {
+            $Link = $evaluatedLink
+        }
+    }
 
     $trimmed = $Link.Trim()
 
@@ -1957,7 +2069,10 @@ function Test-UrlPathUnderPrefix {
 }
 
 function New-FollowBoundary {
-    param([AllowNull()][string[]]$SeedUrls)
+    param(
+        [AllowNull()][string[]]$SeedUrls,
+        [bool]$UseEvaluationValue = $false
+    )
 
     $hosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $domains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1967,7 +2082,8 @@ function New-FollowBoundary {
     foreach ($seedUrl in @($SeedUrls)) {
         if ([string]::IsNullOrWhiteSpace($seedUrl)) { continue }
 
-        $normalizedSeed = ConvertTo-NormalizedLink -Link $seedUrl
+        $seedForBoundary = if ($UseEvaluationValue) { Get-LinkEvaluationValue -Link $seedUrl } else { $seedUrl }
+        $normalizedSeed = ConvertTo-NormalizedLink -Link $seedForBoundary
         if (-not $normalizedSeed) { continue }
 
         $seedHost = Get-UrlHost -Url $normalizedSeed
@@ -2178,7 +2294,9 @@ function Get-RunSignature {
         [string]$RobotsUserAgent,
         [bool]$KeepDuplicates,
         [bool]$NoDuplicates,
-        [bool]$KeepFragments
+        [bool]$KeepFragments,
+        [bool]$StripRegexBeforeEvaluation,
+        [AllowNull()][string]$LinkEvaluationStripRegex
     )
 
     $sourceSig = $Source
@@ -2213,6 +2331,8 @@ function Get-RunSignature {
         "KeepDuplicates=$KeepDuplicates"
         "NoDuplicates=$NoDuplicates"
         "KeepFragments=$KeepFragments"
+        "StripRegexBeforeEvaluation=$StripRegexBeforeEvaluation"
+        "LinkEvaluationStripRegex=$LinkEvaluationStripRegex"
     ) -join "`n"
 
     return Get-Sha256Text $signatureText
@@ -3339,13 +3459,14 @@ function Test-IsBlacklisted {
     param(
         [string]$Url,
         $BlacklistSet,
-        [bool]$KeepFragments = $false
+        [bool]$KeepFragments = $false,
+        [bool]$UseEvaluationValue = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($Url)) { return $false }
     if ($null -eq $BlacklistSet -or $BlacklistSet.Count -eq 0) { return $false }
 
-    return $BlacklistSet.ContainsKey((Get-LinkKey -Link $Url -KeepFragments $KeepFragments))
+    return $BlacklistSet.ContainsKey((Get-LinkKey -Link $Url -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue))
 }
 
 # ---------------------------------------------------------------------------
@@ -5198,7 +5319,8 @@ function Write-MatchedLinks {
         [string]$BlacklistScope,
         [bool]$KeepDuplicates = $false,
         [bool]$NoDuplicates = $true,
-        [bool]$KeepFragments = $false
+        [bool]$KeepFragments = $false,
+        [bool]$UseEvaluationValue = $false
     )
 
     $stats = [pscustomobject]@{
@@ -5211,7 +5333,7 @@ function Write-MatchedLinks {
 
     # Apply search pattern(s)
     $matched = @($Links.Where({
-        Test-LinkMatchesSearch -Link $_ -RegexList $RegexList -Mode $SearchMode
+        Test-LinkMatchesSearch -Link $_ -RegexList $RegexList -Mode $SearchMode -UseEvaluationValue $UseEvaluationValue
     }))
 
     $stats.Matched = $matched.Count
@@ -5221,7 +5343,7 @@ function Write-MatchedLinks {
     if ($null -ne $ExcludeRegexList -and $ExcludeRegexList.Count -gt 0) {
         $beforeExclude = $matched.Count
         $matched = @($matched.Where({
-            -not (Test-LinkMatchesExclude -Link $_ -RegexList $ExcludeRegexList -Mode $ExcludeMode)
+            -not (Test-LinkMatchesExclude -Link $_ -RegexList $ExcludeRegexList -Mode $ExcludeMode -UseEvaluationValue $UseEvaluationValue)
         }))
         $stats.Excluded = $beforeExclude - $matched.Count
     }
@@ -5239,7 +5361,7 @@ function Write-MatchedLinks {
         $dedupedMatched = New-Object System.Collections.Generic.List[string]
 
         foreach ($link in $matched) {
-            $key = Get-LinkKey -Link $link -KeepFragments $KeepFragments
+            $key = Get-LinkKey -Link $link -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue
             if ($seenInBatch.Add($key)) {
                 $dedupedMatched.Add($link)
             }
@@ -5253,7 +5375,7 @@ function Write-MatchedLinks {
     if ((Test-BlacklistAppliesToOutput -Scope $BlacklistScope) -and $null -ne $BlacklistSet -and $BlacklistSet.Count -gt 0) {
         $beforeBl = $matched.Count
         $matched = @($matched.Where({
-            -not (Test-IsBlacklisted -Url $_ -BlacklistSet $BlacklistSet -KeepFragments $KeepFragments)
+            -not (Test-IsBlacklisted -Url $_ -BlacklistSet $BlacklistSet -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue)
         }))
         $stats.Blacklisted = $beforeBl - $matched.Count
     }
@@ -5267,12 +5389,12 @@ function Write-MatchedLinks {
 
         if ($KeepDuplicates) {
             foreach ($link in $matched) {
-                $key = Get-LinkKey -Link $link -KeepFragments $KeepFragments
+                $key = Get-LinkKey -Link $link -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue
 
                 # Keep duplicates from this page, but still skip links already
                 # present in the existing output file or written by previous pages.
                 if (-not $WrittenSet.ContainsKey($key)) {
-                    $toWriteList.Add((Get-LinkWriteValue -Link $link -KeepFragments $KeepFragments))
+                    $toWriteList.Add((Get-LinkWriteValue -Link $link -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue))
                 }
             }
         }
@@ -5282,13 +5404,13 @@ function Write-MatchedLinks {
             )
 
             foreach ($link in $matched) {
-                $key = Get-LinkKey -Link $link -KeepFragments $KeepFragments
+                $key = Get-LinkKey -Link $link -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue
 
                 if (
                     -not $WrittenSet.ContainsKey($key) -and
                     $seenThisBatch.Add($key)
                 ) {
-                    $toWriteList.Add((Get-LinkWriteValue -Link $link -KeepFragments $KeepFragments))
+                    $toWriteList.Add((Get-LinkWriteValue -Link $link -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue))
                 }
             }
         }
@@ -5297,7 +5419,7 @@ function Write-MatchedLinks {
         $stats.Duplicates += ($beforeDedup - $toWrite.Count)
     }
     else {
-        $toWrite = @(@($matched).ForEach({ Get-LinkWriteValue -Link $_ -KeepFragments $KeepFragments }))
+        $toWrite = @(@($matched).ForEach({ Get-LinkWriteValue -Link $_ -KeepFragments $KeepFragments -UseEvaluationValue $UseEvaluationValue }))
     }
 
     if ($toWrite.Count -eq 0) { return $stats }
@@ -5314,6 +5436,8 @@ function Write-MatchedLinks {
 
     if ($NoDuplicates) {
         foreach ($link in $toWrite) {
+            # $toWrite already contains the evaluated/write value, so do not
+            # apply the evaluation regex again when updating the written set.
             [void]$WrittenSet.TryAdd((Get-LinkKey -Link $link -KeepFragments $KeepFragments), [byte]0)
         }
     }
@@ -5760,7 +5884,9 @@ try {
         -RobotsUserAgent $RobotsUserAgent `
         -KeepDuplicates $KeepDuplicates `
         -NoDuplicates $NoDuplicates `
-        -KeepFragments $KeepFragments
+        -KeepFragments $KeepFragments `
+        -StripRegexBeforeEvaluation ([bool]$StripRegexBeforeEvaluation) `
+        -LinkEvaluationStripRegex $LinkEvaluationStripRegex
 
     # Validate resume signature before start-phase maintenance and source filtering
     $completedSourceSet = $null
@@ -5801,7 +5927,14 @@ try {
             # ReadLines creates a streaming enumerable, avoiding memory bloat
             foreach ($line in [System.IO.File]::ReadLines($outPathSafe, [System.Text.Encoding]::UTF8)) {
                 if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    # Existing output may contain either already-stripped values from a
+                    # previous run or original/raw values from an older run. Store both
+                    # keys so duplicate checks work without stripping an already-stripped
+                    # output line a second time.
                     [void]$writtenSet.TryAdd((Get-LinkKey -Link $line -KeepFragments $KeepFragments), [byte]0)
+                    if ($Script:StripRegexBeforeEvaluation) {
+                        [void]$writtenSet.TryAdd((Get-LinkKey -Link $line -KeepFragments $KeepFragments -UseEvaluationValue $true), [byte]0)
+                    }
                 }
             }
             Write-Host "Loaded $($writtenSet.Count) existing link(s) from output file."
@@ -5833,6 +5966,9 @@ try {
                         $normalized = ConvertTo-NormalizedLink -Link $blLine
                         if ($normalized) {
                             [void]$blacklistSet.TryAdd((Get-LinkKey -Link $normalized -KeepFragments $KeepFragments), [byte]0)
+                            if ($Script:StripRegexBeforeEvaluation) {
+                                [void]$blacklistSet.TryAdd((Get-LinkKey -Link $normalized -KeepFragments $KeepFragments -UseEvaluationValue $true), [byte]0)
+                            }
                         }
                     }
                 }
@@ -5868,6 +6004,9 @@ try {
     if ($effectiveExcludePatterns.Count -gt 0) {
         Write-Host "Exclude pattern(s): $($effectiveExcludePatterns -join ', ')"
         Write-Host "Exclude mode: $ExcludeMode"
+    }
+    if ($Script:StripRegexBeforeEvaluation) {
+        Write-Host "Link evaluation regex stripping: enabled. Regex removed before matching/output/dedup: $LinkEvaluationStripRegex"
     }
     if ($Script:CrawlEnabled) {
         $subdomainText = if ($FollowSubdomains) {
@@ -6011,7 +6150,7 @@ try {
                         -OutFile $OutputFile -WrittenSet $writtenSet `
                         -BlacklistSet $blacklistSet `
                         -BlacklistScope $BlacklistScope `
-                        -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments)
+                        -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
 
             return [pscustomobject]@{
                 Url            = $Url
@@ -6055,7 +6194,7 @@ try {
             [switch]$SingleSeedMode
         )
 
-        $boundary = New-FollowBoundary -SeedUrls $SeedUrls
+        $boundary = New-FollowBoundary -SeedUrls $SeedUrls -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
         $queue = [System.Collections.Generic.Queue[object]]::new()
         $scheduled = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $initialSkipped = 0
@@ -6330,7 +6469,7 @@ try {
                             -OutFile $OutputFile -WrittenSet $writtenSet `
                             -BlacklistSet $blacklistSet `
                             -BlacklistScope $BlacklistScope `
-                            -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments)
+                            -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
                 $totalMatched        += $stats.Matched
                 $totalExcluded       += $stats.Excluded
                 $totalBlacklistOut   += $stats.Blacklisted
@@ -6546,7 +6685,7 @@ try {
                 # parallel mode to fail with a "command not found" error inside
                 # the worker, which is hard to diagnose from the parent.
                 $funcNames = @(
-                    'Get-LinkKey', 'Test-IsLikelyRelativeAssetPath', 'Limit-NormalizedLinkLength', 'ConvertTo-NormalizedLink',
+                    'Get-LinkKey', 'Get-LinkEvaluationValue', 'Test-IsLikelyRelativeAssetPath', 'Limit-NormalizedLinkLength', 'ConvertTo-NormalizedLink',
                     'ConvertFrom-JsUrl', 'Invoke-WebRequestWithRetry',
                     'Get-RobotsOriginKey', 'Get-RobotsTxtUrlForUrl', 'Get-RobotsPathAndQuery',
                     'New-RobotsPathRule', 'Add-RobotsGroupIfPresent', 'ConvertFrom-RobotsTxt',
@@ -6620,6 +6759,12 @@ try {
                     else {
                         [TimeSpan]::FromSeconds($_.RegexTimeoutSeconds)
                     }
+                    # Parallel workers only fetch/extract. Link-evaluation stripping is
+                    # applied centrally in the parent thread when results are written.
+                    $Script:StripRegexBeforeEvaluation = $false
+                    $Script:LinkEvaluationStripRegexText = $null
+                    $Script:LinkEvaluationStripRegexObject = $null
+                    $Script:LinkEvaluationStripRegexWarned = $false
 
                     # Recreate functions and regexes in this runspace (only once per worker)
                     $defs = $_.FuncDefs
@@ -6736,7 +6881,7 @@ try {
                                     -OutFile $OutputFile -WrittenSet $writtenSet `
                                     -BlacklistSet $blacklistSet `
                                     -BlacklistScope $BlacklistScope `
-                                    -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments)
+                                    -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
                         $totalMatched      += $stats.Matched
                         $totalExcluded     += $stats.Excluded
                         $totalBlacklistOut += $stats.Blacklisted
@@ -6823,7 +6968,7 @@ try {
                                     -OutFile $OutputFile -WrittenSet $writtenSet `
                                     -BlacklistSet $blacklistSet `
                                     -BlacklistScope $BlacklistScope `
-                                    -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments)
+                                    -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
                         $totalMatched        += $stats.Matched
                         $totalExcluded       += $stats.Excluded
                         $totalBlacklistOut   += $stats.Blacklisted
@@ -6938,6 +7083,7 @@ try {
     Write-Host "Total written to file:       $totalWritten"
     Write-Host "Total failed URLs:           $totalFailed"
     Write-Host "robots.txt enforced:         $EnforceRobotsTxt"
+    Write-Host "Evaluation regex stripping:  $($Script:StripRegexBeforeEvaluation)"
     if ($Script:CrawlEnabled) {
         Write-Host "Crawl follow depth:          $($Script:FollowDepthDisplay)"
         Write-Host "Crawl scope:                 $FollowScope"
