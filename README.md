@@ -360,10 +360,10 @@ This is not the same as `-ExcludePattern`. `-ExcludePattern` rejects a link. Reg
 Example links:
 
 ```text
-https://example.example.org/example/example/1
-https://example.example.org/example/example/2
-https://example.example.org/example/example/10
-https://example.example.org/example/example/111
+https://blog.example.org/article/june/1
+https://blog.example.org/article/june/2
+https://blog.example.org/article/june/10
+https://blog.example.org/article/june/111
 ```
 
 Command option:
@@ -375,12 +375,12 @@ Command option:
 Evaluated and written as:
 
 ```text
-https://example.example.org/example/example
+https://blog.example.org/article/june
 ```
 
 Use an anchored regex when you only want to remove the final part. For example, `/\d+$` removes only a final slash followed by digits. A broader regex will remove whatever it matches.
 
-When crawl mode uses `-FollowPathScope SeedPath`, the seed path boundary is also built from the evaluated seed URL. That means a seed such as `https://example.example.org/example/example/1` uses `/example/example` as the path boundary when the regex above is enabled.
+When crawl mode uses `-FollowPathScope SeedPath`, the seed path boundary is also built from the evaluated seed URL. That means a seed such as `https://blog.example.org/article/june/1` uses `/article/june` as the path boundary when the regex above is enabled.
 
 ---
 
@@ -461,21 +461,21 @@ Use `-DelaySeconds` for throttling.
 ### Strip a numeric final path segment before evaluation
 
 ```text
-.\AE-Find-WebLinks.ps1 "https://example.com" "*example/example*" ".\matched-links.txt" New -StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'
+.\AE-Find-WebLinks.ps1 "https://example.com" "*article/june*" ".\matched-links.txt" New -StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'
 ```
 
 With that option, extracted links such as:
 
 ```text
-https://example.example.org/example/example/1
-https://example.example.org/example/example/2
-https://example.example.org/example/example/10
+https://blog.example.org/article/june/1
+https://blog.example.org/article/june/2
+https://blog.example.org/article/june/10
 ```
 
 are evaluated and written as:
 
 ```text
-https://example.example.org/example/example
+https://blog.example.org/article/june
 ```
 
 ### Enable robots.txt enforcement
