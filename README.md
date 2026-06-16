@@ -14,9 +14,7 @@ It is a raw-response extraction and crawling tool, not a browser. It does **not*
 
 **Latest version:** `1.7.1`
 
-Version `1.7.1` adds optional regex-based link evaluation stripping. This lets the script remove a regex-matched part of an extracted link before matching, exclusion checks, output blacklist checks, output deduplication, and writing. For example, links ending in `/1`, `/2`, `/10`, or `/111` can be evaluated and saved as the same base URL by using `-StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'`.
-
-Version `1.7.0` added controlled crawling and link-following support while preserving the old default behaviour.
+Version `1.7.1` adds optional regex-based link evaluation stripping. This lets the script remove a regex-matched part of an extracted link before matching, exclusion checks, output blacklist checks, output deduplication, and writing. For example, links ending in `/1`, `/2`, `/10`, or `/111` can be evaluated and saved as the same base URL by using `-StripRegexBeforeEvaluation -LinkEvaluationStripRegex '/\d+$'`. Version `1.7.0` added controlled crawling and link-following support while preserving the old default behaviour.
 
 By default, AE-Find-WebLinks still scans only the source URL or URLs you provide. Crawling is disabled unless explicitly enabled with `-FollowDepth`, `-FollowUntilExhausted`, `-FollowToEnd`, or `-UnlimitedFollowDepth`.
 
