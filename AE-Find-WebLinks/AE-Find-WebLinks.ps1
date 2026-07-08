@@ -278,6 +278,13 @@ param(
     [ValidateSet("Append", "New")]
     [string]$FailedUrlMode = "Append",
 
+    # After a run with failures, launch one extra pass using the same parameters
+    # in resume mode. This is intentionally one pass only to avoid infinite loops
+    # against permanently broken URLs.
+    [Parameter(Mandatory = $false)]
+    [Alias("AutoRetryFailed", "RetryFailedAtEnd")]
+    [switch]$RetryFailedOnFinish,
+
     # Advanced operational limits. Defaults preserve existing behaviour.
     # Prevents loading massive files into RAM during deduplication.
     [Parameter(Mandatory = $false)]
@@ -604,8 +611,9 @@ function Show-Usage {
     Write-Host "  -FailedUrlFile <f>         File where failed source URLs and errors are written (tab-separated)"
     Write-Host "  -LogMode <Append|New>      Append to or overwrite the CSV log file (default: Append)"
     Write-Host "  -FailedUrlMode <Append|New> Append to or overwrite the failed URL file (default: Append)"
-    Write-Host "  -Resume                   Resume a previous File-mode run using the progress file"
-    Write-Host "  -ProgressFile <f>         Progress file used by resume mode. Default: <OutputFile>.progress"
+    Write-Host "  -RetryFailedOnFinish      After failures, run one automatic resume pass using the same command"
+    Write-Host "  -Resume                   Resume a previous File-mode or crawl-mode run using the progress file"
+    Write-Host "  -ProgressFile <f>         Progress file used by resume mode. Default: <OutputFile>.progress or <OutputFile>.crawl.progress"
     Write-Host "  -ThrottleLimit <n>        Process n URLs in parallel (default: 1 = sequential). Requires PS 7+"
     Write-Host "  -DeduplicateFiles         Legacy: deduplicate source, output, and blacklist files before starting"
     Write-Host "  -KeepFragments            Preserve URL fragments (#...) for deduplication (useful for SPAs)"
@@ -650,10 +658,11 @@ function Show-Usage {
     Write-Host ""
     Write-Host "Resume behaviour:"
     Write-Host "  In File mode, the script writes each completed source URL to a progress file."
-    Write-Host "  If interrupted, rerun with -Resume to skip already processed source URLs."
+    Write-Host "  In crawl mode, the script writes a crawl journal: scheduled URLs plus completed URLs."
+    Write-Host "  If interrupted, rerun with -Resume to skip already processed work and continue the frontier."
     Write-Host "  Failed URLs are written to -FailedUrlFile if supplied, but are not marked complete."
     Write-Host "  This lets -Resume retry failed or unfinished URLs instead of silently skipping them."
-    Write-Host "  The resume signature detects if search/exclude/output settings have changed."
+    Write-Host "  The resume signature detects if search/exclude/output/crawl settings have changed."
     Write-Host ""
     Write-Host "Examples -- single URL (SourceType = Url):"
     Write-Host ""
@@ -712,6 +721,9 @@ function Show-Usage {
     Write-Host ""
     Write-Host "  Crawl until the allowed frontier is exhausted; default MaxFollowPages is still 1000:"
     Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com/1`" `"*news*story*`" `"matched.txt`" New -FollowUntilExhausted -FollowScope SameDomain -FollowPathScope SeedPath"
+    Write-Host ""
+    Write-Host "  Resumable unbounded same-host crawl, confined to the seed path, with one automatic retry pass:"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com/1`" `"*zip*`" `"matched.txt`" Append Url -FollowUntilExhausted -FollowScope SameHost -FollowPathScope SeedPath -MaxFollowPages 0 -ProgressFile `"matched.crawl.progress`" -FailedUrlFile `"failed.tsv`" -RetryFailedOnFinish"
     Write-Host ""
     Write-Host "  Crawl same-domain direct subdomains too, but not deeper nested subdomains:"
     Write-Host "  .\AE-Find-WebLinks.ps1 `"https://example.com`" `"*zip*`" `"matched.txt`" New -FollowDepth 2 -FollowSubdomains:`$true -MaxSubdomainDepth 1"
@@ -1328,7 +1340,7 @@ function New-RunCommandFromInteractiveAnswers {
     # Append Switch settings
     foreach ($name in @(
         "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments", "StripRegexBeforeEvaluation", "EnforceRobotsTxt", "FollowUntilExhausted",
-        "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues"
+        "RetryFailedOnFinish", "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues"
     )) {
         if ($Settings.ContainsKey($name)) {
             Add-CommandSwitch -Parts $parts -Name $name -Enabled $Settings[$name]
@@ -2296,7 +2308,15 @@ function Get-RunSignature {
         [bool]$NoDuplicates,
         [bool]$KeepFragments,
         [bool]$StripRegexBeforeEvaluation,
-        [AllowNull()][string]$LinkEvaluationStripRegex
+        [AllowNull()][string]$LinkEvaluationStripRegex,
+        [bool]$CrawlEnabled = $false,
+        [bool]$FollowDepthUnlimited = $false,
+        [int]$FollowDepth = 0,
+        [string]$FollowScope = "SameDomain",
+        [string]$FollowPathScope = "Any",
+        [bool]$FollowSubdomains = $false,
+        [int]$MaxSubdomainDepth = 1,
+        [int]$MaxFollowPages = 1000
     )
 
     $sourceSig = $Source
@@ -2315,7 +2335,7 @@ function Get-RunSignature {
     )
 
     $delim = [char]0x1F  # Unit separator -- cannot appear in user patterns
-    $signatureText = @(
+    $signatureParts = @(
         "SourceType=$SourceType"
         "Source=$sourceSig"
         "OutputFile=$outputSig"
@@ -2333,8 +2353,25 @@ function Get-RunSignature {
         "KeepFragments=$KeepFragments"
         "StripRegexBeforeEvaluation=$StripRegexBeforeEvaluation"
         "LinkEvaluationStripRegex=$LinkEvaluationStripRegex"
-    ) -join "`n"
+    )
 
+    # Do not add crawl fields to non-crawl signatures; that keeps old File-mode
+    # progress files compatible. Crawl resume needs these fields because changing
+    # any of them changes the frontier that should be explored.
+    if ($CrawlEnabled) {
+        $signatureParts += @(
+            "CrawlEnabled=$CrawlEnabled"
+            "FollowDepthUnlimited=$FollowDepthUnlimited"
+            "FollowDepth=$FollowDepth"
+            "FollowScope=$FollowScope"
+            "FollowPathScope=$FollowPathScope"
+            "FollowSubdomains=$FollowSubdomains"
+            "MaxSubdomainDepth=$MaxSubdomainDepth"
+            "MaxFollowPages=$MaxFollowPages"
+        )
+    }
+
+    $signatureText = $signatureParts -join "`n"
     return Get-Sha256Text $signatureText
 }
 
@@ -2477,6 +2514,256 @@ function Remove-ProgressFileIfSafe {
     catch {
         Write-Warning "Could not remove progress file: $Path. $($_.Exception.Message)"
     }
+}
+
+function ConvertTo-CrawlProgressField {
+    param([AllowNull()][string]$Value)
+
+    if ($null -eq $Value) { $Value = "" }
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$Value))
+}
+
+function ConvertFrom-CrawlProgressField {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    try {
+        return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value.Trim()))
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-CrawlProgressEntry {
+    param(
+        [string]$Path,
+        [string]$Entry
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
+    $safePath = Get-SafeAbsolutePath $Path
+    try {
+        Write-FileWithRetry -FilePath $safePath -Content $Entry
+    }
+    catch {
+        throw "Progress write failed for ${safePath}: $($_.Exception.Message)"
+    }
+}
+
+function Initialize-CrawlProgressFile {
+    param(
+        [string]$Path,
+        [string]$Signature,
+        [switch]$Resume
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "Crawl resume requires a progress file path."
+    }
+
+    $scheduledSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $completedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $queueItems   = [System.Collections.Generic.List[object]]::new()
+    $loadedExisting = $false
+
+    if ((Test-Path -LiteralPath $Path) -and $Resume) {
+        $fileInfo = Get-Item -LiteralPath $Path
+        if ($fileInfo.Length -eq 0) {
+            Write-Host "Crawl progress file is empty (likely from a crash). Removing and starting fresh."
+            Remove-Item -LiteralPath $Path -Force
+        }
+        else {
+            $loadedExisting = $true
+            $scheduledMap = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $scheduledOrder = [System.Collections.Generic.List[string]]::new()
+
+            $safeProgressPath = Get-SafeAbsolutePath $Path
+            $lineEnum = [System.IO.File]::ReadLines($safeProgressPath, [System.Text.Encoding]::UTF8).GetEnumerator()
+            $signatureLine = $null
+            $headerLinesChecked = 0
+
+            try {
+                while ($lineEnum.MoveNext()) {
+                    $headerLinesChecked++
+                    if ($lineEnum.Current -match '^# Signature:') {
+                        $signatureLine = $lineEnum.Current
+                        break
+                    }
+
+                    if ($headerLinesChecked -ge 8) { break }
+                }
+
+                if (-not $signatureLine) {
+                    throw "Crawl progress file exists but has no signature near the top: $Path. Delete it or use a different -ProgressFile."
+                }
+
+                $existingSignature = ($signatureLine -replace '^# Signature:\s*', '').Trim()
+                if ($existingSignature -ne $Signature) {
+                    throw "Crawl progress file belongs to a different run configuration: $Path. The source, output, search, blacklist, or crawl settings changed. Delete the progress file to start fresh, or rerun with the original command."
+                }
+
+                while ($lineEnum.MoveNext()) {
+                    $line = $lineEnum.Current
+                    if ([string]::IsNullOrWhiteSpace($line) -or $line.Trim().StartsWith("#")) { continue }
+
+                    $parts = $line -split "`t", 3
+                    if ($parts.Count -lt 2) { continue }
+
+                    $entryType = $parts[0].Trim().ToUpperInvariant()
+                    switch ($entryType) {
+                        "ENQUEUED" {
+                            if ($parts.Count -lt 3) { continue }
+                            [int]$depth = 0
+                            if (-not [int]::TryParse($parts[1], [ref]$depth)) { continue }
+
+                            $url = ConvertFrom-CrawlProgressField -Value $parts[2]
+                            if ([string]::IsNullOrWhiteSpace($url)) { continue }
+
+                            $key = Get-LinkKey -Link $url -KeepFragments:$false
+                            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+
+                            if (-not $scheduledMap.ContainsKey($key)) {
+                                $scheduledMap[$key] = [pscustomobject]@{ Url = $url; Depth = $depth }
+                                [void]$scheduledOrder.Add($key)
+                            }
+                        }
+                        "DONE" {
+                            $doneKey = ConvertFrom-CrawlProgressField -Value $parts[1]
+                            if (-not [string]::IsNullOrWhiteSpace($doneKey)) {
+                                [void]$completedSet.Add($doneKey)
+                            }
+                        }
+                    }
+                }
+            }
+            finally {
+                $lineEnum.Dispose()
+            }
+
+            foreach ($key in $scheduledOrder) {
+                [void]$scheduledSet.Add($key)
+                if (-not $completedSet.Contains($key)) {
+                    [void]$queueItems.Add($scheduledMap[$key])
+                }
+            }
+
+            Write-Host "Crawl resume enabled. Loaded $($completedSet.Count) completed URL(s), $($scheduledSet.Count) scheduled URL(s), and $($queueItems.Count) remaining frontier URL(s)."
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $folder = Split-Path -Parent $Path
+        if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+            [void](New-Item -ItemType Directory -Path $folder -Force)
+        }
+
+        Set-Content -LiteralPath $Path -Value @(
+            "# AE-Find-WebLinks crawl progress file"
+            "# Signature: $Signature"
+            "# ENQUEUED<TAB>Depth<TAB>Base64Url"
+            "# DONE<TAB>Base64UrlKey"
+        ) -Encoding UTF8
+
+        if ($Resume) {
+            Write-Host "Resume requested, but no crawl progress file exists yet. Starting a new resumable crawl."
+        }
+        Write-Host "Crawl progress file created: $Path"
+    }
+    elseif (-not $Resume) {
+        throw "Crawl progress file already exists: $Path. This usually means a previous crawl was interrupted. Use -Resume to continue, delete the progress file to start fresh, or specify a different -ProgressFile."
+    }
+
+    return [pscustomobject]@{
+        ScheduledSet      = $scheduledSet
+        CompletedSet      = $completedSet
+        QueueItems        = $queueItems
+        LoadedFromExisting = $loadedExisting
+    }
+}
+
+function Add-CrawlScheduledProgress {
+    param(
+        [string]$Path,
+        [string]$Url,
+        [int]$Depth,
+        $ScheduledSet
+    )
+
+    $key = Get-LinkKey -Link $Url -KeepFragments:$false
+    if ([string]::IsNullOrWhiteSpace($key)) { return $false }
+
+    if ($ScheduledSet.Add($key)) {
+        $encodedUrl = ConvertTo-CrawlProgressField -Value $Url
+        Write-CrawlProgressEntry -Path $Path -Entry "ENQUEUED`t$Depth`t$encodedUrl"
+        return $true
+    }
+
+    return $false
+}
+
+function Add-CrawlCompletedProgress {
+    param(
+        [string]$Path,
+        [string]$Url,
+        $CompletedSet
+    )
+
+    $key = Get-LinkKey -Link $Url -KeepFragments:$false
+    if ([string]::IsNullOrWhiteSpace($key)) { return }
+
+    if ($CompletedSet.Add($key)) {
+        $encodedKey = ConvertTo-CrawlProgressField -Value $key
+        Write-CrawlProgressEntry -Path $Path -Entry "DONE`t$encodedKey"
+    }
+}
+
+function Invoke-RetryFailedOnFinishPass {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$OriginalParameters,
+
+        [AllowNull()][string]$ScriptPath,
+        [AllowNull()][string]$ProgressFilePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
+        Write-Warning "-RetryFailedOnFinish cannot launch a resume pass because the current script path is unavailable. Re-run the same command with -Resume."
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ProgressFilePath) -or -not (Test-Path -LiteralPath $ProgressFilePath)) {
+        Write-Warning "-RetryFailedOnFinish has no progress file to resume from. Re-run manually after supplying -ProgressFile, or use a File/crawl mode that creates one."
+        return $false
+    }
+
+    $retryParams = @{}
+    foreach ($key in $OriginalParameters.Keys) {
+        $retryParams[$key] = $OriginalParameters[$key]
+    }
+
+    # Prevent data loss and prevent recursive auto-retry loops.
+    $retryParams["Resume"] = $true
+    $retryParams["Mode"] = "Append"
+    $retryParams["LogMode"] = "Append"
+    $retryParams["FailedUrlMode"] = "Append"
+    $retryParams["ProgressFile"] = $ProgressFilePath
+    if ($retryParams.ContainsKey("RetryFailedOnFinish")) {
+        [void]$retryParams.Remove("RetryFailedOnFinish")
+    }
+
+    Write-Host "--- RetryFailedOnFinish: starting one resume pass for failed/unfinished URLs ---"
+    Write-Host "Progress file: $ProgressFilePath"
+
+    & $ScriptPath @retryParams
+
+    if (-not $?) {
+        exit 1
+    }
+
+    exit 0
 }
 
 # ---------------------------------------------------------------------------
@@ -5520,12 +5807,8 @@ try {
         $FailedUrlMode = "Append"
     }
 
-    if ($Resume -and $SourceType -ne "File") {
-        throw "-Resume is only useful with SourceType File."
-    }
-
-    if ($Script:CrawlEnabled -and $Resume) {
-        throw "-Resume is not supported when crawl mode is enabled. A crawl needs to persist its frontier, not just completed source URLs. Re-run without -Resume, or use -FollowDepth 0 for resumable file-list processing."
+    if ($Resume -and (-not $Script:CrawlEnabled) -and $SourceType -ne "File") {
+        throw "-Resume without crawl mode is only useful with SourceType File. Crawl-mode resume supports SourceType Url and File because the crawl frontier is persisted."
     }
 
     if ($Script:CrawlEnabled -and $ThrottleLimit -gt 1) {
@@ -5558,22 +5841,28 @@ try {
     }
 
     # Assign default progress file early so collision checks also cover it.
-    # Crawl mode does not support resume/frontier persistence yet, so do not
-    # create or require a progress file only when crawl mode is disabled.
-    if ($SourceType -eq "File" -and (-not $Script:CrawlEnabled) -and [string]::IsNullOrWhiteSpace($ProgressFile)) {
-        $ProgressFile = "$OutputFile.progress"
+    # Non-crawl File mode keeps the historic <OutputFile>.progress file.
+    # Crawl mode gets its own journal because it must persist the frontier, not
+    # just completed source URLs.
+    if ([string]::IsNullOrWhiteSpace($ProgressFile)) {
+        if ($Script:CrawlEnabled) {
+            $ProgressFile = "$OutputFile.crawl.progress"
+        }
+        elseif ($SourceType -eq "File") {
+            $ProgressFile = "$OutputFile.progress"
+        }
     }
 
-    # Refuse to start a fresh File-mode run when an old progress file exists.
+    # Refuse to start a fresh resumable run when an old progress file exists.
     # This must happen before output/log files are created or overwritten.
     if (
-        $SourceType -eq "File" -and
-        (-not $Script:CrawlEnabled) -and
+        ($Script:CrawlEnabled -or $SourceType -eq "File") -and
         $ProgressFile -and
         (Test-Path -LiteralPath $ProgressFile) -and
         -not $Resume
     ) {
-        throw "Progress file already exists: $ProgressFile. This usually means a previous run was interrupted. Use -Resume to continue, delete the progress file to start fresh, or specify a different -ProgressFile."
+        $progressKind = if ($Script:CrawlEnabled) { "Crawl progress file" } else { "Progress file" }
+        throw "$progressKind already exists: $ProgressFile. This usually means a previous run was interrupted. Use -Resume to continue, delete the progress file to start fresh, or specify a different -ProgressFile."
     }
 
     # #28: Validate output file path for illegal characters
@@ -5762,12 +6051,12 @@ try {
 
     if (
         $Resume -and
-        $SourceType -eq "File" -and
+        ($Script:CrawlEnabled -or $SourceType -eq "File") -and
         $ProgressFile -and
         (Test-Path -LiteralPath $ProgressFile) -and
         -not (Test-Path -LiteralPath $OutputFile)
     ) {
-        throw "Resume progress exists but the output file is missing: $OutputFile. Refusing to continue because completed source URLs would be skipped and their previous matches could be lost. Restore the output file, delete the progress file to restart, or use a different -ProgressFile."
+        throw "Resume progress exists but the output file is missing: $OutputFile. Refusing to continue because completed URLs would be skipped and their previous matches could be lost. Restore the output file, delete the progress file to restart, or use a different -ProgressFile."
     }
 
     # Validate a single URL source before creating or truncating any output/log files.
@@ -5886,11 +6175,19 @@ try {
         -NoDuplicates $NoDuplicates `
         -KeepFragments $KeepFragments `
         -StripRegexBeforeEvaluation ([bool]$StripRegexBeforeEvaluation) `
-        -LinkEvaluationStripRegex $LinkEvaluationStripRegex
+        -LinkEvaluationStripRegex $LinkEvaluationStripRegex `
+        -CrawlEnabled ([bool]$Script:CrawlEnabled) `
+        -FollowDepthUnlimited ([bool]$Script:FollowDepthUnlimited) `
+        -FollowDepth $FollowDepth `
+        -FollowScope $FollowScope `
+        -FollowPathScope $FollowPathScope `
+        -FollowSubdomains ([bool]$FollowSubdomains) `
+        -MaxSubdomainDepth $MaxSubdomainDepth `
+        -MaxFollowPages $MaxFollowPages
 
     # Validate resume signature before start-phase maintenance and source filtering
     $completedSourceSet = $null
-    if ($SourceType -eq "File" -and $Resume -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
+    if ((-not $Script:CrawlEnabled) -and $SourceType -eq "File" -and $Resume -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
         $completedSourceSet = Initialize-ProgressFile `
             -Path $ProgressFile `
             -Signature $runSignature `
@@ -6196,39 +6493,59 @@ try {
 
         $boundary = New-FollowBoundary -SeedUrls $SeedUrls -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
         $queue = [System.Collections.Generic.Queue[object]]::new()
-        $scheduled = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $crawlProgressState = Initialize-CrawlProgressFile -Path $ProgressFile -Signature $runSignature -Resume:$Resume
+        $scheduled = $crawlProgressState.ScheduledSet
+        $crawlCompleted = $crawlProgressState.CompletedSet
         $initialSkipped = 0
 
-        foreach ($seedUrl in @($SeedUrls)) {
-            if ([string]::IsNullOrWhiteSpace($seedUrl)) { continue }
-
-            $normalizedSeed = ConvertTo-NormalizedLink -Link $seedUrl
-            if (-not $normalizedSeed) { continue }
-            if (Test-IsPrivateUrl $normalizedSeed) { continue }
-
-            if ((Test-BlacklistAppliesToInput -Scope $BlacklistScope) -and (Test-IsBlacklisted -Url $normalizedSeed -BlacklistSet $blacklistSet -KeepFragments $KeepFragments)) {
-                $initialSkipped++
-                Write-Host "Source URL is blacklisted. Skipping: $normalizedSeed"
-                Write-LogCsvRow -Url $normalizedSeed -Status "BLACKLISTED_SOURCE" `
-                    -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 1 -Duplicates 0 `
-                    -Written 0 -ErrorMsg ""
-                continue
+        if ($Resume -and $crawlProgressState.LoadedFromExisting -and $crawlCompleted.Count -gt 0 -and (Test-Path -LiteralPath $OutputFile)) {
+            $resumeOutputInfo = Get-Item -LiteralPath $OutputFile -ErrorAction Stop
+            if ($resumeOutputInfo.Length -eq 0) {
+                throw "Crawl resume progress contains $($crawlCompleted.Count) completed URL(s), but the output file is empty: $OutputFile. Refusing to skip completed crawl pages because previous matches may have been lost. Restore the output file, delete the progress file to restart, or use a different -ProgressFile."
             }
+        }
 
-            if ($MaxFollowPages -gt 0 -and $scheduled.Count -ge $MaxFollowPages) {
-                Write-Host "Crawl page cap reached while scheduling seeds ($MaxFollowPages); remaining seeds will not be queued."
-                break
+        if ($Resume -and $crawlProgressState.LoadedFromExisting) {
+            foreach ($queuedItem in @($crawlProgressState.QueueItems)) {
+                $queue.Enqueue([pscustomobject]@{ Url = $queuedItem.Url; Depth = ([int]$queuedItem.Depth) })
             }
+        }
+        else {
+            foreach ($seedUrl in @($SeedUrls)) {
+                if ([string]::IsNullOrWhiteSpace($seedUrl)) { continue }
 
-            $seedKey = Get-LinkKey -Link $normalizedSeed -KeepFragments:$false
-            if ($scheduled.Add($seedKey)) {
-                $queue.Enqueue([pscustomobject]@{ Url = $normalizedSeed; Depth = 0 })
+                $normalizedSeed = ConvertTo-NormalizedLink -Link $seedUrl
+                if (-not $normalizedSeed) { continue }
+                if (Test-IsPrivateUrl $normalizedSeed) { continue }
+
+                if ((Test-BlacklistAppliesToInput -Scope $BlacklistScope) -and (Test-IsBlacklisted -Url $normalizedSeed -BlacklistSet $blacklistSet -KeepFragments $KeepFragments)) {
+                    $initialSkipped++
+                    Write-Host "Source URL is blacklisted. Skipping: $normalizedSeed"
+                    Write-LogCsvRow -Url $normalizedSeed -Status "BLACKLISTED_SOURCE" `
+                        -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 1 -Duplicates 0 `
+                        -Written 0 -ErrorMsg ""
+                    continue
+                }
+
+                if ($MaxFollowPages -gt 0 -and $scheduled.Count -ge $MaxFollowPages) {
+                    Write-Host "Crawl page cap reached while scheduling seeds ($MaxFollowPages); remaining seeds will not be queued."
+                    break
+                }
+
+                if (Add-CrawlScheduledProgress -Path $ProgressFile -Url $normalizedSeed -Depth 0 -ScheduledSet $scheduled) {
+                    $queue.Enqueue([pscustomobject]@{ Url = $normalizedSeed; Depth = 0 })
+                }
             }
         }
 
         $script:totalBlacklistSrc += $initialSkipped
 
         if ($queue.Count -eq 0) {
+            if ($Resume -and $crawlProgressState.LoadedFromExisting) {
+                Write-Host "Crawl resume found no remaining frontier URLs to process."
+                return
+            }
+
             if ($initialSkipped -gt 0) {
                 Write-Host "No URLs left to fetch after source blacklist filtering."
                 return
@@ -6237,7 +6554,12 @@ try {
             throw "No crawl seed URLs available after validation and filtering."
         }
 
-        Write-Host "Crawl seed URL(s): $($queue.Count)"
+        if ($Resume -and $crawlProgressState.LoadedFromExisting) {
+            Write-Host "Crawl remaining frontier URL(s): $($queue.Count)"
+        }
+        else {
+            Write-Host "Crawl seed URL(s): $($queue.Count)"
+        }
         if ($FollowPathScope -eq 'SeedPath') {
             Write-Host "Crawl boundary hosts: $($boundary.Hosts.Count); root domain(s): $($boundary.Domains.Count); seed path boundary/boundaries: $($boundary.SeedPathRules.Count)"
         }
@@ -6298,9 +6620,9 @@ try {
                             continue
                         }
 
-                        $candidateKey = Get-LinkKey -Link $candidateUrl -KeepFragments:$false
-                        if ($scheduled.Add($candidateKey)) {
-                            $queue.Enqueue([pscustomobject]@{ Url = $candidateUrl; Depth = ([int]$item.Depth + 1) })
+                        $nextDepth = ([int]$item.Depth + 1)
+                        if (Add-CrawlScheduledProgress -Path $ProgressFile -Url $candidateUrl -Depth $nextDepth -ScheduledSet $scheduled) {
+                            $queue.Enqueue([pscustomobject]@{ Url = $candidateUrl; Depth = $nextDepth })
                             $enqueuedThisPage++
                         }
                     }
@@ -6312,6 +6634,8 @@ try {
                         Write-Host "  Crawl page cap reached ($MaxFollowPages); no more candidates will be queued."
                     }
                 }
+
+                Add-CrawlCompletedProgress -Path $ProgressFile -Url $item.Url -CompletedSet $crawlCompleted
             }
             elseif ($result.Status -eq "ROBOTS_BLOCKED") {
                 $script:totalRobotsBlocked++
@@ -6322,6 +6646,8 @@ try {
                 Write-LogCsvRow -Url $item.Url -Status "ROBOTS_BLOCKED" `
                     -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
                     -Written 0 -ErrorMsg $robotsMessage
+
+                Add-CrawlCompletedProgress -Path $ProgressFile -Url $item.Url -CompletedSet $crawlCompleted
             }
             else {
                 $script:totalFailed++
@@ -7044,14 +7370,15 @@ try {
 
     # Clean up progress file only after a fully successful completed run.
     # If any URL failed, keep the progress file so -Resume can retry only the unfinished/failed URLs.
-    if ($SourceType -eq "File" -and (-not $Script:CrawlEnabled) -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
+    if (($Script:CrawlEnabled -or ($SourceType -eq "File" -and (-not $Script:CrawlEnabled))) -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
         if ($totalFailed -eq 0) {
             Remove-ProgressFileIfSafe `
                 -Path $ProgressFile `
                 -Reason "Run completed normally."
         }
         else {
-            Write-Host "Progress file kept because $totalFailed URL(s) failed. Re-run with -Resume to retry unfinished URLs."
+            $resumeText = if ($Script:CrawlEnabled) { "Crawl progress file kept" } else { "Progress file kept" }
+            Write-Host "$resumeText because $totalFailed URL(s) failed. Re-run with -Resume to retry unfinished URLs."
         }
     }
 
@@ -7110,6 +7437,17 @@ try {
         Write-Host "Failed URL file mode: $FailedUrlMode"
     }
 
+    if ($totalFailed -gt 0 -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
+        Write-Host "Retry command: re-run the same command with: -Resume -ProgressFile `"$ProgressFile`""
+    }
+
+    if ($RetryFailedOnFinish -and $totalFailed -gt 0) {
+        [void](Invoke-RetryFailedOnFinishPass `
+            -OriginalParameters $PSBoundParameters `
+            -ScriptPath $PSCommandPath `
+            -ProgressFilePath $ProgressFile)
+    }
+
     # In single URL mode, exit with error code if the only URL failed
     if ($SourceType -eq "Url" -and $totalFailed -gt 0) {
         exit 1
@@ -7117,7 +7455,7 @@ try {
 }
 catch {
     if (Test-IsCancellationException $_) {
-        Write-Host "Interrupted by user. Progress file was kept if this was a File-mode run; re-run the same command with -Resume to continue."
+        Write-Host "Interrupted by user. Progress file was kept if this was a File-mode or crawl-mode run; re-run the same command with -Resume to continue."
         exit 130
     }
 
