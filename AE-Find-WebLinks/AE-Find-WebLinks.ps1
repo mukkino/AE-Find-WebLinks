@@ -1,6 +1,6 @@
 #requires -Version 5.1
 
-# AE-Find-WebLinks.ps1 - 1.7.2
+# AE-Find-WebLinks.ps1 - 1.7.4
 # Author: Fabio Lichinchi (mukka)
 # Site: alterego.cc
 # 
@@ -113,6 +113,12 @@ param(
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 2147483647)]
     [int]$TimeoutSeconds = 120,
+
+    # Same-link watchdog. If one URL is still being processed after this many
+    # seconds, restart that URL from scratch. Use 0, Disabled, Off, or None to disable.
+    [Parameter(Mandatory = $false)]
+    [Alias("SameLinkTimeoutSeconds", "UrlWatchdogSeconds", "StuckLinkTimeoutSeconds")]
+    [string]$StuckUrlTimeoutSeconds = "300",
 
     # Delay between fetching different URLs when processing a file list or crawl frontier
     [Parameter(Mandatory = $false)]
@@ -417,11 +423,36 @@ function Assert-OperationalGuardrail {
     }
 }
 
+# Parse same-link watchdog setting. A positive integer enables it; 0/Disabled/Off/None disables it.
+# Keep this outside the param block so commands can use either -StuckUrlTimeoutSeconds 300
+# or -StuckUrlTimeoutSeconds Disabled.
+[int]$Script:StuckUrlTimeoutSeconds = 300
+if (-not $Script:SkipOperationalValidation) {
+    $stuckUrlTimeoutRaw = if ($null -eq $StuckUrlTimeoutSeconds) { "" } else { ([string]$StuckUrlTimeoutSeconds).Trim() }
+
+    if ([string]::IsNullOrWhiteSpace($stuckUrlTimeoutRaw)) {
+        throw "-StuckUrlTimeoutSeconds cannot be empty. Use a positive seconds value, 0, Disabled, Off, or None."
+    }
+
+    if ($stuckUrlTimeoutRaw -match '^(?i:0|disabled|disable|off|none|false)$') {
+        $Script:StuckUrlTimeoutSeconds = 0
+    }
+    else {
+        $parsedStuckUrlTimeoutSeconds = 0
+        if (-not [int]::TryParse($stuckUrlTimeoutRaw, [ref]$parsedStuckUrlTimeoutSeconds) -or $parsedStuckUrlTimeoutSeconds -lt 1) {
+            throw "Invalid -StuckUrlTimeoutSeconds value '$StuckUrlTimeoutSeconds'. Use a positive seconds value, 0, Disabled, Off, or None."
+        }
+
+        $Script:StuckUrlTimeoutSeconds = $parsedStuckUrlTimeoutSeconds
+    }
+}
+
 # These are typo guardrails, not hard limits. Use -AllowExtremeOperationalValues
 # when intentionally running unusual values for very large jobs or controlled tests.
 Assert-OperationalGuardrail -Name "RetryCount" -Value $RetryCount -SafeMaximum 100
 Assert-OperationalGuardrail -Name "WaitSeconds" -Value $WaitSeconds -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "TimeoutSeconds" -Value $TimeoutSeconds -SafeMaximum 86400
+Assert-OperationalGuardrail -Name "StuckUrlTimeoutSeconds" -Value $Script:StuckUrlTimeoutSeconds -SafeMaximum 604800
 Assert-OperationalGuardrail -Name "DelaySeconds" -Value $DelaySeconds -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "FollowDepth" -Value $FollowDepth -SafeMaximum 10
 Assert-OperationalGuardrail -Name "MaxSubdomainDepth" -Value $MaxSubdomainDepth -SafeMaximum 100
@@ -591,6 +622,7 @@ function Show-Usage {
     Write-Host "  -RetryCount <n>            Number of retry attempts per URL (default: 3)"
     Write-Host "  -WaitSeconds <n>           Seconds to wait between retries of the same URL (default: 30)"
     Write-Host "  -TimeoutSeconds <n>        HTTP timeout per request attempt (default: 120)"
+    Write-Host "  -StuckUrlTimeoutSeconds <n|Disabled> Restart the same URL if it is still processing after n seconds (default: 300; 0/Disabled = off)"
     Write-Host "  -DelaySeconds <n>          Seconds to wait between different URLs in File/crawl mode (default: 5)"
     Write-Host "  -FollowDepth <n>           Link-hop depth. 0 = none/default; -1 = until exhausted"
     Write-Host "  -FollowUntilExhausted      Crawl until no new allowed pages remain (aliases: -FollowToEnd, -UnlimitedFollowDepth)"
@@ -1179,6 +1211,7 @@ function Edit-RunOptionalSettings {
                 Set-OptionalIntValue -Settings $Settings -Name "RetryCount" -Prompt "Retry attempts per URL" -Default 3 -Minimum 1
                 Set-OptionalIntValue -Settings $Settings -Name "WaitSeconds" -Prompt "Seconds between retries" -Default 30
                 Set-OptionalIntValue -Settings $Settings -Name "TimeoutSeconds" -Prompt "HTTP timeout per attempt, seconds" -Default 120 -Minimum 1
+                Set-OptionalIntValue -Settings $Settings -Name "StuckUrlTimeoutSeconds" -Prompt "Same-link watchdog seconds. 0 = disabled" -Default 300 -Minimum 0
                 if ($SourceType -eq "File") {
                     Set-OptionalIntValue -Settings $Settings -Name "DelaySeconds" -Prompt "Seconds between different source URLs" -Default 5
                     Set-OptionalIntValue -Settings $Settings -Name "ThrottleLimit" -Prompt "Parallel source URLs. 1 = sequential. PS 7+ required above 1" -Default 1 -Minimum 1
@@ -1319,7 +1352,7 @@ function New-RunCommandFromInteractiveAnswers {
 
     # Append Integer settings
     foreach ($name in @(
-        "RetryCount", "WaitSeconds", "TimeoutSeconds", "DelaySeconds", "FollowDepth", "MaxSubdomainDepth", "MaxFollowPages",
+        "RetryCount", "WaitSeconds", "TimeoutSeconds", "StuckUrlTimeoutSeconds", "DelaySeconds", "FollowDepth", "MaxSubdomainDepth", "MaxFollowPages",
         "SecondFetchWait", "ThrottleLimit", "MaxRedirects", "MaxRetryAfterSeconds", "ConnectionLimit", "MaintenanceLargeFileLimitMB",
         "MaxPageContentMB", "RegexTimeoutSeconds", "MaxUrlLength", "FileWriteRetryCount",
         "FileWriteRetryDelayMinMs", "FileWriteRetryDelayMaxMs", "FileMoveRetryCount", "FileMoveRetryDelayMs",
@@ -1681,6 +1714,100 @@ function Test-IsInvalidWebRequestStateError {
     }
 
     return $false
+}
+
+# Helper: Detects watchdog timeouts used for restarting a URL that is stuck
+function Test-IsStuckUrlTimeoutError {
+    param([AllowNull()][object]$ErrorObject)
+
+    if ($null -eq $ErrorObject) { return $false }
+
+    $message = if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) {
+        $ErrorObject.Exception.Message
+    }
+    elseif ($ErrorObject.PSObject.Properties['Exception']) {
+        $ErrorObject.Exception.Message
+    }
+    else {
+        [string]$ErrorObject
+    }
+
+    return ($message -match '^STUCK_URL_TIMEOUT:')
+}
+
+function Assert-StuckUrlWatchdog {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [AllowNull()][System.Diagnostics.Stopwatch]$Stopwatch,
+        [int]$TimeoutSeconds,
+        [string]$Phase = "processing"
+    )
+
+    if ($TimeoutSeconds -le 0 -or $null -eq $Stopwatch) { return }
+
+    $elapsedSeconds = $Stopwatch.Elapsed.TotalSeconds
+    if ($elapsedSeconds -ge $TimeoutSeconds) {
+        $elapsedDisplay = [int][Math]::Ceiling($elapsedSeconds)
+        throw "STUCK_URL_TIMEOUT: $Url spent $elapsedDisplay second(s) on the same URL while $Phase (limit: $TimeoutSeconds second(s))."
+    }
+}
+
+function Get-StuckUrlRemainingSeconds {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [AllowNull()][System.Diagnostics.Stopwatch]$Stopwatch,
+        [int]$TimeoutSeconds,
+        [string]$Phase = "processing"
+    )
+
+    if ($TimeoutSeconds -le 0 -or $null -eq $Stopwatch) { return $null }
+
+    $remaining = [double]$TimeoutSeconds - $Stopwatch.Elapsed.TotalSeconds
+    if ($remaining -le 0) {
+        Assert-StuckUrlWatchdog -Url $Url -Stopwatch $Stopwatch -TimeoutSeconds $TimeoutSeconds -Phase $Phase
+    }
+
+    return ([int][Math]::Max(1, [Math]::Ceiling($remaining)))
+}
+
+function Get-StuckUrlBoundedTimeoutSeconds {
+    param(
+        [Parameter(Mandatory = $true)][int]$ConfiguredTimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [AllowNull()][System.Diagnostics.Stopwatch]$Stopwatch,
+        [int]$TimeoutSeconds,
+        [string]$Phase = "starting request"
+    )
+
+    $configured = [Math]::Max(1, $ConfiguredTimeoutSeconds)
+    $remaining = Get-StuckUrlRemainingSeconds -Url $Url -Stopwatch $Stopwatch -TimeoutSeconds $TimeoutSeconds -Phase $Phase
+    if ($null -eq $remaining) { return $configured }
+
+    return ([int][Math]::Max(1, [Math]::Min($configured, [int]$remaining)))
+}
+
+function Start-SleepWithStuckUrlWatchdog {
+    param(
+        [Parameter(Mandatory = $true)][int]$Seconds,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [AllowNull()][System.Diagnostics.Stopwatch]$Stopwatch,
+        [int]$TimeoutSeconds,
+        [string]$Phase = "waiting"
+    )
+
+    if ($Seconds -le 0) { return }
+
+    if ($TimeoutSeconds -le 0 -or $null -eq $Stopwatch) {
+        Start-Sleep -Seconds $Seconds
+        return
+    }
+
+    $remaining = Get-StuckUrlRemainingSeconds -Url $Url -Stopwatch $Stopwatch -TimeoutSeconds $TimeoutSeconds -Phase $Phase
+    $sleepSeconds = [Math]::Min([double]$Seconds, [double]$remaining)
+    $sleepMilliseconds = [int][Math]::Max(1, [Math]::Min([double]([int]::MaxValue - 1), [Math]::Floor($sleepSeconds * 1000.0)))
+
+    Start-Sleep -Milliseconds $sleepMilliseconds
+    Assert-StuckUrlWatchdog -Url $Url -Stopwatch $Stopwatch -TimeoutSeconds $TimeoutSeconds -Phase $Phase
 }
 
 # ---------------------------------------------------------------------------
@@ -4679,7 +4806,9 @@ function Get-RobotsPolicyForUrl {
         [Parameter(Mandatory = $true)][string]$UserAgentString,
         [AllowNull()][string]$ProxyUrl,
         [Parameter(Mandatory = $true)][int]$MaxRedirectsCount,
-        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue
+        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue,
+        [AllowNull()][System.Diagnostics.Stopwatch]$StuckUrlStopwatch = $null,
+        [int]$StuckUrlTimeoutSecondsValue = 0
     )
 
     $originKey = Get-RobotsOriginKey -Url $Url
@@ -4716,7 +4845,9 @@ function Get-RobotsPolicyForUrl {
             -MaxRedirectsCount $MaxRedirectsCount `
             -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
             -EnforceRobotsTxt $false `
-            -RobotsUserAgentValue $RobotsUserAgentValue
+            -RobotsUserAgentValue $RobotsUserAgentValue `
+            -StuckUrlStopwatch $StuckUrlStopwatch `
+            -StuckUrlTimeoutSecondsValue $StuckUrlTimeoutSecondsValue
 
         $robotsText = Get-ResponseContentText -Response $response -Context "robots.txt"
         if ($Script:MaxRobotsTxtBytes -gt 0) {
@@ -4741,6 +4872,7 @@ function Get-RobotsPolicyForUrl {
     }
     catch {
         if (Test-IsCancellationException $_) { throw }
+        if (Test-IsStuckUrlTimeoutError $_) { throw }
 
         $message = $_.Exception.Message
         $status = Get-RobotsHttpStatusFromErrorMessage -Message $message
@@ -4784,7 +4916,9 @@ function Test-RobotsTxtAllowed {
         [Parameter(Mandatory = $true)][string]$UserAgentString,
         [AllowNull()][string]$ProxyUrl,
         [Parameter(Mandatory = $true)][int]$MaxRedirectsCount,
-        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue
+        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue,
+        [AllowNull()][System.Diagnostics.Stopwatch]$StuckUrlStopwatch = $null,
+        [int]$StuckUrlTimeoutSecondsValue = 0
     )
 
     $normalizedUrl = ConvertTo-NormalizedLink -Link $Url
@@ -4809,7 +4943,9 @@ function Test-RobotsTxtAllowed {
         -UserAgentString $UserAgentString `
         -ProxyUrl $ProxyUrl `
         -MaxRedirectsCount $MaxRedirectsCount `
-        -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue
+        -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
+        -StuckUrlStopwatch $StuckUrlStopwatch `
+        -StuckUrlTimeoutSecondsValue $StuckUrlTimeoutSecondsValue
 
     if ($policy.Status -eq "UNAVAILABLE") {
         return [pscustomobject]@{ Allowed = $false; Status = "UNAVAILABLE"; Reason = $policy.Message }
@@ -4838,7 +4974,9 @@ function Assert-RobotsTxtAllowsUrl {
         [Parameter(Mandatory = $true)][string]$UserAgentString,
         [AllowNull()][string]$ProxyUrl,
         [Parameter(Mandatory = $true)][int]$MaxRedirectsCount,
-        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue
+        [Parameter(Mandatory = $true)][int]$MaxRetryAfterSecondsValue,
+        [AllowNull()][System.Diagnostics.Stopwatch]$StuckUrlStopwatch = $null,
+        [int]$StuckUrlTimeoutSecondsValue = 0
     )
 
     if (-not $Enabled) { return }
@@ -4852,7 +4990,9 @@ function Assert-RobotsTxtAllowsUrl {
         -UserAgentString $UserAgentString `
         -ProxyUrl $ProxyUrl `
         -MaxRedirectsCount $MaxRedirectsCount `
-        -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue
+        -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
+        -StuckUrlStopwatch $StuckUrlStopwatch `
+        -StuckUrlTimeoutSecondsValue $StuckUrlTimeoutSecondsValue
 
     if ($decision.Allowed) { return }
 
@@ -4897,7 +5037,9 @@ function Invoke-WebRequestWithRetry {
         [int]$MaxRedirectsCount,
         [int]$MaxRetryAfterSecondsValue,
         [bool]$EnforceRobotsTxt = $false,
-        [string]$RobotsUserAgentValue = "AE-Find-WebLinks"
+        [string]$RobotsUserAgentValue = "AE-Find-WebLinks",
+        [AllowNull()][System.Diagnostics.Stopwatch]$StuckUrlStopwatch = $null,
+        [int]$StuckUrlTimeoutSecondsValue = 0
     )
 
     if ($Url -notmatch '^https?://') { $Url = "https://$Url" }
@@ -4928,6 +5070,8 @@ function Invoke-WebRequestWithRetry {
             throw "SSRF Blocked: URL targets a private/internal network ($currentUrl)."
         }
 
+        Assert-StuckUrlWatchdog -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "preparing request"
+
         Assert-RobotsTxtAllowsUrl `
             -Enabled $EnforceRobotsTxt `
             -Url $currentUrl `
@@ -4939,13 +5083,21 @@ function Invoke-WebRequestWithRetry {
             -UserAgentString $UserAgentString `
             -ProxyUrl $ProxyUrl `
             -MaxRedirectsCount $MaxRedirectsCount `
-            -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue
+            -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
+            -StuckUrlStopwatch $StuckUrlStopwatch `
+            -StuckUrlTimeoutSecondsValue $StuckUrlTimeoutSecondsValue
 
         $lastError = $null
 
         for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
             try {
                 Write-Host "  Attempt $attempt of $MaxRetries -- GET $currentUrl"
+                $attemptTimeout = Get-StuckUrlBoundedTimeoutSeconds `
+                    -ConfiguredTimeoutSeconds $Timeout `
+                    -Url $currentUrl `
+                    -Stopwatch $StuckUrlStopwatch `
+                    -TimeoutSeconds $StuckUrlTimeoutSecondsValue `
+                    -Phase "starting HTTP request"
 
                 # Disable automatic redirect following so every Location target can be
                 # validated before another network request is made.
@@ -4956,9 +5108,11 @@ function Invoke-WebRequestWithRetry {
                     -UserAgent $UserAgentString `
                     -UseBasicParsing `
                     -MaximumRedirection 0 `
-                    -TimeoutSec $Timeout `
+                    -TimeoutSec $attemptTimeout `
                     -ErrorAction Stop `
                     @webRequestProxyParams
+
+                Assert-StuckUrlWatchdog -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "completing HTTP request"
 
                 $statusCode = Get-ResponseStatusCode -Response $response
                 if ($null -ne $statusCode -and $statusCode -in @(301, 302, 303, 307, 308)) {
@@ -5000,12 +5154,19 @@ function Invoke-WebRequestWithRetry {
                 # keep the larger body. No extra console output.
                 if ($DoSecondFetch) {
                     if ($SecondWait -gt 0) {
-                        Start-Sleep -Seconds $SecondWait
+                        Start-SleepWithStuckUrlWatchdog -Seconds $SecondWait -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "waiting before second fetch"
                     }
 
                     $response2 = $null
                     $keepResponse2 = $false
                     try {
+                        $secondAttemptTimeout = Get-StuckUrlBoundedTimeoutSeconds `
+                            -ConfiguredTimeoutSeconds $Timeout `
+                            -Url $currentUrl `
+                            -Stopwatch $StuckUrlStopwatch `
+                            -TimeoutSeconds $StuckUrlTimeoutSecondsValue `
+                            -Phase "starting second fetch"
+
                         $response2 = Invoke-WebRequest `
                             -Uri $currentUrl `
                             -WebSession $session `
@@ -5013,9 +5174,11 @@ function Invoke-WebRequestWithRetry {
                             -UserAgent $UserAgentString `
                             -UseBasicParsing `
                             -MaximumRedirection 0 `
-                            -TimeoutSec $Timeout `
+                            -TimeoutSec $secondAttemptTimeout `
                             -ErrorAction Stop `
                             @webRequestProxyParams
+
+                        Assert-StuckUrlWatchdog -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "completing second fetch"
 
                         $statusCode2 = Get-ResponseStatusCode -Response $response2
                         if ($null -ne $statusCode2 -and $statusCode2 -in @(301, 302, 303, 307, 308)) {
@@ -5038,6 +5201,7 @@ function Invoke-WebRequestWithRetry {
                     }
                     catch {
                         if (Test-IsCancellationException $_) { throw }
+                        if (Test-IsStuckUrlTimeoutError $_) { throw }
 
                         # Second fetch failed silently -- use first response.
                         $excResponse = Get-ErrorResponse $_
@@ -5052,6 +5216,8 @@ function Invoke-WebRequestWithRetry {
                         }
                     }
                 }
+
+                Assert-StuckUrlWatchdog -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "before meta-refresh scan"
 
                 # Check for <meta http-equiv="refresh"> redirect (quoted or unquoted).
                 $responseTextForMetaRefresh = Get-ResponseContentText -Response $response -Context "meta-refresh scan"
@@ -5098,13 +5264,15 @@ function Invoke-WebRequestWithRetry {
                 }
 
                 $attemptErrorMessage = $_.Exception.Message
-                if ($attemptErrorMessage -match '^(SSRF Blocked:|ROBOTS_TXT_BLOCKED:|ROBOTS_TXT_UNAVAILABLE:|Too many HTTP redirects|Too many meta-refresh redirects|Invalid HTTP redirect target|HTTP redirect .* did not include a Location header|Invalid URL:)') {
+                if ($attemptErrorMessage -match '^(SSRF Blocked:|ROBOTS_TXT_BLOCKED:|ROBOTS_TXT_UNAVAILABLE:|STUCK_URL_TIMEOUT:|Too many HTTP redirects|Too many meta-refresh redirects|Invalid HTTP redirect target|HTTP redirect .* did not include a Location header|Invalid URL:)') {
                     if ($null -ne $response) {
                         Close-BaseResponseSafe $response
                         $response = $null
                     }
                     throw
                 }
+
+                Assert-StuckUrlWatchdog -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "handling failed HTTP attempt"
 
                 $lastError = $_
                 Write-Host "  Attempt $attempt failed: $attemptErrorMessage"
@@ -5132,10 +5300,12 @@ function Invoke-WebRequestWithRetry {
                             -UserAgent $UserAgentString `
                             -Headers $headers `
                             -Session $session `
-                            -TimeoutSec $Timeout `
+                            -TimeoutSec (Get-StuckUrlBoundedTimeoutSeconds -ConfiguredTimeoutSeconds $Timeout -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "recovering redirect target") `
                             -ProxyUrl $ProxyUrl
                     }
                     catch {
+                        if (Test-IsStuckUrlTimeoutError $_) { throw }
+
                         # Fallback itself failed (network error, DNS, etc.).
                         # Fall through to normal retry rather than getting stuck.
                         Write-Host "  Could not recover redirect target via fallback: $($_.Exception.Message)"
@@ -5225,7 +5395,7 @@ function Invoke-WebRequestWithRetry {
                                     elseif ($raSec -le $MaxRetryAfterSecondsValue) {
                                         Write-Host "  Server requested Retry-After: $raSec second(s)"
                                         Close-BaseResponseSafe $responseObj
-                                        Start-Sleep -Seconds $raSec
+                                        Start-SleepWithStuckUrlWatchdog -Seconds $raSec -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "honouring Retry-After"
                                         continue
                                     }
                                 }
@@ -5236,7 +5406,7 @@ function Invoke-WebRequestWithRetry {
                                         if ($deltaSeconds -gt 0 -and $MaxRetryAfterSecondsValue -gt 0 -and $deltaSeconds -le $MaxRetryAfterSecondsValue) {
                                             Write-Host "  Server requested Retry-After date; waiting $deltaSeconds second(s)"
                                             Close-BaseResponseSafe $responseObj
-                                            Start-Sleep -Seconds $deltaSeconds
+                                            Start-SleepWithStuckUrlWatchdog -Seconds $deltaSeconds -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "honouring Retry-After date"
                                             continue
                                         }
                                     }
@@ -5253,7 +5423,7 @@ function Invoke-WebRequestWithRetry {
                     $effectiveWait = [Math]::Max(0, $WaitSec)
                     if ($effectiveWait -gt 0) {
                         Write-Host "  Retrying in $effectiveWait second(s) ..."
-                        Start-Sleep -Seconds $effectiveWait
+                        Start-SleepWithStuckUrlWatchdog -Seconds $effectiveWait -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "waiting before retry"
                     }
                     else {
                         Write-Host "  Retrying immediately ..."
@@ -5292,10 +5462,13 @@ function Get-LinksFromWebPage {
         [bool]$EnforceRobotsTxt = $false,
         [string]$RobotsUserAgentValue = "AE-Find-WebLinks",
         [int64]$MaxPageContentBytesValue,
-        [int]$MaxPageContentMBValue
+        [int]$MaxPageContentMBValue,
+        [AllowNull()][System.Diagnostics.Stopwatch]$StuckUrlStopwatch = $null,
+        [int]$StuckUrlTimeoutSecondsValue = 0
     )
 
     if ($PageUrl -notmatch '^https?://') { $PageUrl = "https://$PageUrl" }
+    Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "starting page fetch"
 
     $response = $null
 
@@ -5312,7 +5485,11 @@ function Get-LinksFromWebPage {
             -MaxRedirectsCount $MaxRedirectsCount `
             -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
             -EnforceRobotsTxt $EnforceRobotsTxt `
-            -RobotsUserAgentValue $RobotsUserAgentValue
+            -RobotsUserAgentValue $RobotsUserAgentValue `
+            -StuckUrlStopwatch $StuckUrlStopwatch `
+            -StuckUrlTimeoutSecondsValue $StuckUrlTimeoutSecondsValue
+
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "after HTTP fetch"
 
         # Force Content-Type to scalar and split comma-separated values.
         $contentType = Get-ResponseMediaType -Response $response
@@ -5333,6 +5510,7 @@ function Get-LinksFromWebPage {
         }
 
         $html = Get-ResponseContentText -Response $response -Context "page body"
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "reading page body"
 
         # Additional size guard after content is loaded. String.Length is UTF-16
         # code units, not bytes, so compare the configured byte limit to an
@@ -5412,6 +5590,8 @@ function Get-LinksFromWebPage {
             $htmlClean = $html
         }
 
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "preparing link extraction"
+
         # #12: Extract OpenGraph, Twitter Card, and other meta content URLs
         foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexMetaContentUrl -InputText $htmlClean -Name "meta content URLs")) {
             $found.Add($m.Groups["url"].Value)
@@ -5424,6 +5604,8 @@ function Get-LinksFromWebPage {
                 $found.Add($val)
             }
         }
+
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "extracting style/meta URLs"
 
         # ----- 1. Quoted HTML attributes: href, src, action, data-*, etc. -----
         foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexAttr -InputText $htmlClean -Name "quoted HTML attributes")) {
@@ -5441,6 +5623,8 @@ function Get-LinksFromWebPage {
         foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexRawUrl -InputText $htmlClean -Name "raw URLs")) {
             $found.Add($m.Value)
         }
+
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "extracting raw and attribute URLs"
 
         # ----- 3. URLs inside <script> blocks (JSON, JS assignments, etc.) ----
         foreach ($scriptMatch in (Get-RegexMatchesSafe -Regex $global:RegexScript -InputText $htmlClean -Name "script blocks")) {
@@ -5473,6 +5657,8 @@ function Get-LinksFromWebPage {
             }
         }
 
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "extracting script and noscript URLs"
+
         # ----- 5. CSS url() references ----------------------------------------
         foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexCssUrl -InputText $htmlClean -Name "CSS url() references")) {
             $val = $m.Groups["url"].Value
@@ -5482,6 +5668,8 @@ function Get-LinksFromWebPage {
             }
         }
 
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "normalising extracted URLs"
+
         # Normalize everything and remove failed normalisations
         return @(
             @($found).ForEach({ ConvertTo-NormalizedLink -Link $_ -BaseUri $baseUri }).Where({ $_ })
@@ -5490,6 +5678,74 @@ function Get-LinksFromWebPage {
     finally {
         # Dispose network streams to prevent resource leaks on long runs
         Close-BaseResponseSafe $response
+    }
+}
+
+function Invoke-GetLinksFromWebPageWithWatchdog {
+    param(
+        [string]$PageUrl,
+        [int]$MaxRetries,
+        [int]$WaitSec,
+        [int]$TimeoutSec,
+        [bool]$DoSecondFetch,
+        [int]$SecondWaitSec,
+        [string]$UserAgentString,
+        [AllowNull()][string]$ProxyUrl,
+        [int]$MaxRedirectsCount,
+        [int]$MaxRetryAfterSecondsValue,
+        [bool]$EnforceRobotsTxt = $false,
+        [string]$RobotsUserAgentValue = "AE-Find-WebLinks",
+        [int64]$MaxPageContentBytesValue,
+        [int]$MaxPageContentMBValue
+    )
+
+    $watchdogLimit = if ($null -ne $Script:StuckUrlTimeoutSeconds) { [int]$Script:StuckUrlTimeoutSeconds } else { 0 }
+    $maxWatchdogRuns = if ($watchdogLimit -gt 0) { [Math]::Max(1, $MaxRetries) } else { 1 }
+
+    for ($watchdogRun = 1; $watchdogRun -le $maxWatchdogRuns; $watchdogRun++) {
+        $watchdog = $null
+
+        if ($watchdogLimit -gt 0) {
+            $watchdog = [System.Diagnostics.Stopwatch]::StartNew()
+        }
+
+        try {
+            return @(Get-LinksFromWebPage `
+                -PageUrl $PageUrl `
+                -MaxRetries $MaxRetries `
+                -WaitSec $WaitSec `
+                -TimeoutSec $TimeoutSec `
+                -DoSecondFetch $DoSecondFetch `
+                -SecondWaitSec $SecondWaitSec `
+                -UserAgentString $UserAgentString `
+                -ProxyUrl $ProxyUrl `
+                -MaxRedirectsCount $MaxRedirectsCount `
+                -MaxRetryAfterSecondsValue $MaxRetryAfterSecondsValue `
+                -EnforceRobotsTxt $EnforceRobotsTxt `
+                -RobotsUserAgentValue $RobotsUserAgentValue `
+                -MaxPageContentBytesValue $MaxPageContentBytesValue `
+                -MaxPageContentMBValue $MaxPageContentMBValue `
+                -StuckUrlStopwatch $watchdog `
+                -StuckUrlTimeoutSecondsValue $watchdogLimit)
+        }
+        catch {
+            if (Test-IsStuckUrlTimeoutError $_) {
+                $watchdogMessage = $_.Exception.Message
+
+                if ($watchdogRun -lt $maxWatchdogRuns) {
+                    Write-Host "  URL watchdog: $watchdogMessage"
+                    Write-Host "  Restarting this URL (watchdog run $($watchdogRun + 1) of $maxWatchdogRuns) ..."
+                    continue
+                }
+
+                throw "$watchdogMessage Watchdog restart limit reached after $maxWatchdogRuns run(s); increase -StuckUrlTimeoutSeconds, reduce -TimeoutSeconds/-WaitSeconds, or set -StuckUrlTimeoutSeconds Disabled to disable."
+            }
+
+            throw
+        }
+        finally {
+            if ($null -ne $watchdog) { $watchdog.Stop() }
+        }
     }
 }
 
@@ -6305,6 +6561,12 @@ try {
     if ($Script:StripRegexBeforeEvaluation) {
         Write-Host "Link evaluation regex stripping: enabled. Regex removed before matching/output/dedup: $LinkEvaluationStripRegex"
     }
+    if ($Script:StuckUrlTimeoutSeconds -gt 0) {
+        Write-Host "Same-URL watchdog: restart URL after $($Script:StuckUrlTimeoutSeconds) second(s)."
+    }
+    else {
+        Write-Host "Same-URL watchdog: disabled."
+    }
     if ($Script:CrawlEnabled) {
         $subdomainText = if ($FollowSubdomains) {
             if ($MaxSubdomainDepth -eq 0) { "enabled, unlimited subdomain depth" } else { "enabled, max subdomain depth $MaxSubdomainDepth" }
@@ -6425,7 +6687,7 @@ try {
         )
 
         try {
-            $links = @(Get-LinksFromWebPage `
+            $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
                 -PageUrl $Url `
                 -MaxRetries $RetryCount `
                 -WaitSec $WaitSeconds `
@@ -6771,7 +7033,7 @@ try {
         else {
             Write-Host "Fetching page: $sourceUrl"
             try {
-                $links = @(Get-LinksFromWebPage `
+                $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
                     -PageUrl $sourceUrl `
                     -MaxRetries $RetryCount `
                     -WaitSec $WaitSeconds `
@@ -7019,8 +7281,9 @@ try {
                     'Test-RobotsPathAllowedByRules', 'New-RobotsPolicyObject', 'Get-RobotsHttpStatusFromErrorMessage',
                     'Get-RobotsPolicyForUrl', 'Test-RobotsTxtAllowed', 'Assert-RobotsTxtAllowsUrl',
                     'Test-IsRobotsTxtBlockedError', 'Test-IsRobotsTxtUnavailableError',
-                    'Get-LinksFromWebPage', 'Close-BaseResponseSafe',
-                    'Test-IsCancellationException', 'Test-IsInvalidWebRequestStateError',
+                    'Get-LinksFromWebPage', 'Invoke-GetLinksFromWebPageWithWatchdog', 'Close-BaseResponseSafe',
+                    'Test-IsCancellationException', 'Test-IsInvalidWebRequestStateError', 'Test-IsStuckUrlTimeoutError',
+                    'Assert-StuckUrlWatchdog', 'Get-StuckUrlRemainingSeconds', 'Get-StuckUrlBoundedTimeoutSeconds', 'Start-SleepWithStuckUrlWatchdog',
                     'Test-IsPrivateIPAddress', 'Test-IsPrivateUrl', 'Resolve-SearchEngineLink',
                     'New-FindWebLinksRequestSession', 'Get-RedirectTargetViaRawRequest', 'Get-FindWebLinksProxyParameters',
                     'Get-ResponseStatusCode', 'Get-ResponseHeaderValue',
@@ -7066,6 +7329,7 @@ try {
                         MaxRobotsTxtBytes = $Script:MaxRobotsTxtBytes
                         RegexTimeoutSeconds = $RegexTimeoutSeconds
                         DnsResolutionTimeoutSeconds = $Script:DnsResolutionTimeoutSeconds
+                        StuckUrlTimeoutSeconds = $Script:StuckUrlTimeoutSeconds
                     }
                 } | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
                     $url = $_.Url
@@ -7079,6 +7343,7 @@ try {
                     $Script:MaxRobotsTxtBytes = $_.MaxRobotsTxtBytes
                     $Script:RobotsTxtCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
                     $Script:DnsResolutionTimeoutSeconds = $_.DnsResolutionTimeoutSeconds
+                    $Script:StuckUrlTimeoutSeconds = $_.StuckUrlTimeoutSeconds
                     $Script:RegexTimeout = if ($_.RegexTimeoutSeconds -eq 0) {
                         [System.Text.RegularExpressions.Regex]::InfiniteMatchTimeout
                     }
@@ -7134,7 +7399,7 @@ try {
                     }
 
                     try {
-                        $links = @(Get-LinksFromWebPage `
+                        $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
                             -PageUrl $url `
                             -MaxRetries $_.RetryCount `
                             -WaitSec $_.WaitSeconds `
@@ -7270,7 +7535,7 @@ try {
                     Write-Host "[$index / $($urls.Count)] Fetching: $url"
 
                     try {
-                        $links = @(Get-LinksFromWebPage `
+                        $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
                             -PageUrl $url `
                             -MaxRetries $RetryCount `
                             -WaitSec $WaitSeconds `
