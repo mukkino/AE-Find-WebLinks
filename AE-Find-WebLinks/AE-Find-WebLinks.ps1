@@ -26,7 +26,7 @@
 # BUGS & FEATURE REQUESTS
 # Bug reports and feature requests are appreciated!
 # Please visit the project's page, which you can find at:
-#     https://alterego.cc
+#     https://alterego.cc/wp/ae-find-weblinks/
 # -------------------------------------------------------
 # DISCLAIMER
 # Before diving into the code, a small reality check.
