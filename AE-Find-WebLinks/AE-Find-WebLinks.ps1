@@ -417,7 +417,7 @@ $ErrorActionPreference = "Stop"
 # Suppress the visual progress bar which massively slows down Invoke-WebRequest
 $ProgressPreference = 'SilentlyContinue'
 
-$Script:ScriptVersion = "1.9.1"
+$Script:ScriptVersion = "1.8.0"
 
 # Host detection. $IsWindows/$IsLinux/$IsMacOS only exist on PowerShell 6+, and
 # under Set-StrictMode reading a missing variable throws, so probe them safely.
