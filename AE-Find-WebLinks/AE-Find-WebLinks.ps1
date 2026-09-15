@@ -1,6 +1,6 @@
 #requires -Version 5.1
 
-# AE-Find-WebLinks.ps1 - 1.7.4
+# AE-Find-WebLinks.ps1 - 1.8.0
 # Author: Fabio Lichinchi (mukka)
 # Site: alterego.cc
 # 
@@ -207,8 +207,11 @@ param(
     [ValidateSet("Input", "Output", "Both")]
     [string]$BlacklistScope = "Both",
 
-    # Multi-threading control (requires PowerShell 7+)
+    # Parallel processing. 1 = sequential (default). Values above 1 fetch that many
+    # source/crawl URLs at once in worker runspaces and require PowerShell 7 or later;
+    # on Windows PowerShell 5.1 the script stops with an explanation.
     [Parameter(Mandatory = $false)]
+    [Alias("Parallel", "Workers")]
     [ValidateRange(1, 2147483647)]
     [int]$ThrottleLimit = 1,
 
@@ -264,7 +267,7 @@ param(
 
     # Disguises the script as a standard web browser
     [Parameter(Mandatory = $false)]
-    [string]$UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    [string]$UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
 
     # File tracking paths
     [Parameter(Mandatory = $false)]
@@ -357,6 +360,39 @@ param(
     [ValidateRange(0, 100)]
     [double]$HighFailureRatePercent = 50,
 
+    # Extra HTTP request headers as "Name: value" strings.
+    # Example: -Header "Referer: https://example.com","Cookie: session=abc"
+    [Parameter(Mandatory = $false)]
+    [Alias("Headers")]
+    [string[]]$Header,
+
+    # Skip TLS certificate validation (expired or self-signed certificates on old sites).
+    [Parameter(Mandatory = $false)]
+    [Alias("Insecure", "IgnoreCertificateErrors")]
+    [switch]$SkipCertificateCheck,
+
+    # Scheme assumed for bare hosts such as example.com/path in sources, redirects,
+    # and extracted text. Old sites are often http-only.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("https", "http")]
+    [string]$DefaultScheme = "https",
+
+    # Less console output: one line per URL plus failures, warnings, and totals.
+    [Parameter(Mandatory = $false)]
+    [Alias("q")]
+    [switch]$Quiet,
+
+    # Stop starting new URLs after this many minutes. The progress file is kept so
+    # the run can continue with -Resume; exit code 3 signals the stop. 0 = no limit.
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 2147483647)]
+    [int]$MaxRunMinutes = 0,
+
+    # Random 0..n extra seconds added to every -DelaySeconds wait (politeness jitter).
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 2147483647)]
+    [int]$DelayJitterSeconds = 0,
+
     # Help triggers
     [Parameter(Mandatory = $false)]
     [Alias("h")]
@@ -364,7 +400,11 @@ param(
 
     [Parameter(Mandatory = $false)]
     [Alias("Interactive")]
-    [switch]$InteractiveHelp
+    [switch]$InteractiveHelp,
+
+    # Print the script version and the PowerShell host it runs on, then exit
+    [Parameter(Mandatory = $false)]
+    [switch]$Version
 )
 
 # ==============================================================================
@@ -377,10 +417,19 @@ $ErrorActionPreference = "Stop"
 # Suppress the visual progress bar which massively slows down Invoke-WebRequest
 $ProgressPreference = 'SilentlyContinue'
 
-# Help-only flows (-Help, -InteractiveHelp, or no parameters at all) should
+$Script:ScriptVersion = "1.9.1"
+
+# Host detection. $IsWindows/$IsLinux/$IsMacOS only exist on PowerShell 6+, and
+# under Set-StrictMode reading a missing variable throws, so probe them safely.
+$Script:PSMajorVersion = [int]$PSVersionTable.PSVersion.Major
+$Script:PSEditionName = if ($PSVersionTable.ContainsKey('PSEdition') -and $PSVersionTable.PSEdition) { [string]$PSVersionTable.PSEdition } else { "Desktop" }
+$Script:IsWindowsHost = if ($Script:PSMajorVersion -ge 6) { [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue) } else { $true }
+$Script:HostDescription = "PowerShell $($PSVersionTable.PSVersion) ($($Script:PSEditionName) edition) on $([System.Environment]::OSVersion.VersionString)"
+
+# Help-only flows (-Help, -InteractiveHelp, -Version, or no parameters at all) should
 # never be blocked by operational validation meant for real runs. Detect them
 # up-front and let downstream guardrails skip themselves.
-$Script:SkipOperationalValidation = $Help -or $InteractiveHelp -or ($PSBoundParameters.Count -eq 0)
+$Script:SkipOperationalValidation = $Help -or $InteractiveHelp -or $Version -or ($PSBoundParameters.Count -eq 0)
 
 # Effective crawl mode. Keep -FollowDepth 0 as "no crawl" because that is the
 # default requested for link following and preserves old commands. Unlimited
@@ -426,7 +475,10 @@ function Assert-OperationalGuardrail {
 # Parse same-link watchdog setting. A positive integer enables it; 0/Disabled/Off/None disables it.
 # Keep this outside the param block so commands can use either -StuckUrlTimeoutSeconds 300
 # or -StuckUrlTimeoutSeconds Disabled.
-[int]$Script:StuckUrlTimeoutSeconds = 300
+# The parsed value must NOT be stored in $Script:StuckUrlTimeoutSeconds: script-scope
+# variables and script parameters share one scope, so that name IS the parameter and
+# assigning it overwrote the user's value with the default before it was read.
+[int]$Script:StuckUrlWatchdogSeconds = 300
 if (-not $Script:SkipOperationalValidation) {
     $stuckUrlTimeoutRaw = if ($null -eq $StuckUrlTimeoutSeconds) { "" } else { ([string]$StuckUrlTimeoutSeconds).Trim() }
 
@@ -435,7 +487,7 @@ if (-not $Script:SkipOperationalValidation) {
     }
 
     if ($stuckUrlTimeoutRaw -match '^(?i:0|disabled|disable|off|none|false)$') {
-        $Script:StuckUrlTimeoutSeconds = 0
+        $Script:StuckUrlWatchdogSeconds = 0
     }
     else {
         $parsedStuckUrlTimeoutSeconds = 0
@@ -443,7 +495,7 @@ if (-not $Script:SkipOperationalValidation) {
             throw "Invalid -StuckUrlTimeoutSeconds value '$StuckUrlTimeoutSeconds'. Use a positive seconds value, 0, Disabled, Off, or None."
         }
 
-        $Script:StuckUrlTimeoutSeconds = $parsedStuckUrlTimeoutSeconds
+        $Script:StuckUrlWatchdogSeconds = $parsedStuckUrlTimeoutSeconds
     }
 }
 
@@ -452,13 +504,15 @@ if (-not $Script:SkipOperationalValidation) {
 Assert-OperationalGuardrail -Name "RetryCount" -Value $RetryCount -SafeMaximum 100
 Assert-OperationalGuardrail -Name "WaitSeconds" -Value $WaitSeconds -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "TimeoutSeconds" -Value $TimeoutSeconds -SafeMaximum 86400
-Assert-OperationalGuardrail -Name "StuckUrlTimeoutSeconds" -Value $Script:StuckUrlTimeoutSeconds -SafeMaximum 604800
+Assert-OperationalGuardrail -Name "StuckUrlTimeoutSeconds" -Value $Script:StuckUrlWatchdogSeconds -SafeMaximum 604800
 Assert-OperationalGuardrail -Name "DelaySeconds" -Value $DelaySeconds -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "FollowDepth" -Value $FollowDepth -SafeMaximum 10
 Assert-OperationalGuardrail -Name "MaxSubdomainDepth" -Value $MaxSubdomainDepth -SafeMaximum 100
 Assert-OperationalGuardrail -Name "MaxFollowPages" -Value $MaxFollowPages -SafeMaximum 1000000
 Assert-OperationalGuardrail -Name "SecondFetchWait" -Value $SecondFetchWait -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "ThrottleLimit" -Value $ThrottleLimit -SafeMaximum 64
+Assert-OperationalGuardrail -Name "MaxRunMinutes" -Value $MaxRunMinutes -SafeMaximum 525600
+Assert-OperationalGuardrail -Name "DelayJitterSeconds" -Value $DelayJitterSeconds -SafeMaximum 86400
 Assert-OperationalGuardrail -Name "MaxPageContentMB" -Value $MaxPageContentMB -SafeMaximum 1024
 Assert-OperationalGuardrail -Name "RegexTimeoutSeconds" -Value $RegexTimeoutSeconds -SafeMaximum 3600
 Assert-OperationalGuardrail -Name "MaxUrlLength" -Value $MaxUrlLength -SafeMaximum 1048576
@@ -477,8 +531,19 @@ if ($AllowExtremeOperationalValues) {
 
 # Configure .NET network defaults for higher throughput and modern security
 [System.Net.ServicePointManager]::DefaultConnectionLimit = $ConnectionLimit
-# Enforce TLS 1.2+ for modern HTTPS sites (PS 5.1 defaults to TLS 1.0 on older systems)
+# Enforce TLS 1.2+ for modern HTTPS sites (PS 5.1 defaults to TLS 1.0 on older systems).
+# TLS 1.3 is added when the runtime knows it (.NET Framework 4.8 / .NET Core 3+);
+# the assignment can throw on OS builds without TLS 1.3 support, so it is guarded.
+# On PowerShell 7 the Core transport uses HttpClient, which negotiates TLS itself
+# and ignores ServicePointManager (including DefaultConnectionLimit); the settings
+# below therefore matter on Windows PowerShell 5.1 only.
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+if ([System.Enum]::IsDefined([System.Net.SecurityProtocolType], 'Tls13')) {
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls13
+    }
+    catch { }
+}
 
 # Centralised operational limits. Defaults preserve previous hardcoded values.
 # Any 0 MB size limit means "no limit" for that guard.
@@ -513,7 +578,7 @@ else {
 # a routine knob. Five seconds comfortably covers normal authoritative servers.
 [int]$Script:DnsResolutionTimeoutSeconds = 5
 
-# robots.txt cache is per process/runspace and keyed by origin (scheme + host + port).
+# robots.txt cache is per run and keyed by origin (scheme + host + port).
 # Enforcement is opt-in via -EnforceRobotsTxt.
 [int]$Script:MaxRobotsTxtBytes = 512000
 $Script:RobotsTxtCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new(
@@ -536,7 +601,9 @@ else {
 # temporary/evaluated form of each extracted link by removing a regex match before
 # search matching, exclude matching, output blacklist checks, output deduplication,
 # and output writing. The actual fetched source/crawl URL is not rewritten.
-[bool]$Script:StripRegexBeforeEvaluation = $false
+# (Named ...Enabled on purpose: $Script:StripRegexBeforeEvaluation would be the
+# -StripRegexBeforeEvaluation switch itself and resetting it here disabled the switch.)
+[bool]$Script:StripRegexBeforeEvaluationEnabled = $false
 [string]$Script:LinkEvaluationStripRegexText = $null
 $Script:LinkEvaluationStripRegexObject = $null
 [bool]$Script:LinkEvaluationStripRegexWarned = $false
@@ -556,12 +623,57 @@ if (-not $Script:SkipOperationalValidation) {
             $evaluationRegexOptions = [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
             $Script:LinkEvaluationStripRegexObject = [regex]::new($LinkEvaluationStripRegex, $evaluationRegexOptions, $Script:RegexTimeout)
             $Script:LinkEvaluationStripRegexText = $LinkEvaluationStripRegex
-            $Script:StripRegexBeforeEvaluation = $true
+            $Script:StripRegexBeforeEvaluationEnabled = $true
         }
         catch {
             throw "Invalid -LinkEvaluationStripRegex '$LinkEvaluationStripRegex': $($_.Exception.Message)"
         }
     }
+}
+
+# Run-wide options added in 1.9.0. Kept under distinct $Script: names so they never
+# collide with the parameters (script scope and parameter scope are the same scope).
+[string]$Script:BareHostScheme = $DefaultScheme
+[bool]$Script:QuietMode = [bool]$Quiet
+[int]$Script:DelayJitterSecondsValue = $DelayJitterSeconds
+$Script:RunDeadline = if ($MaxRunMinutes -gt 0) { (Get-Date).AddMinutes($MaxRunMinutes) } else { $null }
+[bool]$Script:RunDeadlineHit = $false
+
+# Extra request headers ("Name: value"). Parsed once; merged into every request.
+$Script:ExtraHeaders = @{}
+if (-not $Script:SkipOperationalValidation -and $Header) {
+    foreach ($headerText in $Header) {
+        if ([string]::IsNullOrWhiteSpace($headerText)) { continue }
+        $separatorIndex = $headerText.IndexOf(':')
+        if ($separatorIndex -le 0) {
+            throw "Invalid -Header value '$headerText'. Use the form 'Name: value', for example -Header 'Referer: https://example.com'."
+        }
+        $headerName = $headerText.Substring(0, $separatorIndex).Trim()
+        $headerValue = $headerText.Substring($separatorIndex + 1).Trim()
+        if ($headerName -notmatch '^[A-Za-z0-9!#$%&''*+.^_`|~-]+$') {
+            throw "Invalid header name '$headerName' in -Header '$headerText'."
+        }
+        if ($headerName -ieq 'User-Agent') {
+            throw "Set the User-Agent with -UserAgent instead of -Header."
+        }
+        $Script:ExtraHeaders[$headerName] = $headerValue
+    }
+}
+
+# Capability probes: newer Invoke-WebRequest parameters are used only when the
+# running PowerShell has them, so one script works unchanged on 5.1 and 7.x.
+$invokeWebRequestParameters = (Get-Command -Name Invoke-WebRequest).Parameters
+[bool]$Script:IwrSupportsOperationTimeout = $invokeWebRequestParameters.ContainsKey('OperationTimeoutSeconds')
+[bool]$Script:IwrSupportsSkipCertificateCheck = $invokeWebRequestParameters.ContainsKey('SkipCertificateCheck')
+$Script:WebRequestExtraParams = @{}
+[bool]$Script:DesktopSkipCertificateValidation = [bool]$SkipCertificateCheck
+if (-not $Script:SkipOperationalValidation -and [bool]$SkipCertificateCheck) {
+    if ($Script:IwrSupportsSkipCertificateCheck) {
+        $Script:WebRequestExtraParams['SkipCertificateCheck'] = $true
+    }
+    # Desktop requests set a native per-request callback only when they execute.
+    # No process-wide certificate callback is changed, including maintenance/help.
+    Write-Warning "TLS certificate validation is disabled for this run (-SkipCertificateCheck)."
 }
 
 # ---------------------------------------------------------------------------
@@ -646,7 +758,14 @@ function Show-Usage {
     Write-Host "  -RetryFailedOnFinish      After failures, run one automatic resume pass using the same command"
     Write-Host "  -Resume                   Resume a previous File-mode or crawl-mode run using the progress file"
     Write-Host "  -ProgressFile <f>         Progress file used by resume mode. Default: <OutputFile>.progress or <OutputFile>.crawl.progress"
-    Write-Host "  -ThrottleLimit <n>        Process n URLs in parallel (default: 1 = sequential). Requires PS 7+"
+    Write-Host "  -ThrottleLimit <n>        Fetch n source/crawl URLs at a time (default: 1 = sequential). Needs PowerShell 7+"
+    Write-Host "  -MaxRunMinutes <n>        Stop starting new URLs after n minutes; keep progress for -Resume; exit code 3 (default: 0 = no limit)"
+    Write-Host "  -DelayJitterSeconds <n>   Add random 0..n seconds to every -DelaySeconds wait (default: 0)"
+    Write-Host "  -Header <h1>,<h2>         Extra request headers as 'Name: value' strings, e.g. 'Referer: https://x.test','Cookie: a=b'"
+    Write-Host "  -SkipCertificateCheck     Do not validate TLS certificates (expired/self-signed certificates on old sites)"
+    Write-Host "  -DefaultScheme <https|http> Scheme assumed for bare hosts like example.com/path (default: https)"
+    Write-Host "  -Quiet                    One line per URL plus failures, warnings, and totals"
+    Write-Host "  -Version                  Print the script version and the PowerShell host, then exit"
     Write-Host "  -DeduplicateFiles         Legacy: deduplicate source, output, and blacklist files before starting"
     Write-Host "  -KeepFragments            Preserve URL fragments (#...) for deduplication (useful for SPAs)"
     Write-Host "  -StripRegexBeforeEvaluation  Strip regex matches from links before search/exclude/output evaluation"
@@ -666,7 +785,7 @@ function Show-Usage {
     Write-Host "  -MaxUrlLength <n>                       Max extracted URL length before skipping; dedup key truncation guard (default: 8192, 0 = no limit)"
     Write-Host "  -MaxRedirects <n>                       Max HTTP/meta-refresh redirects (default: 10)"
     Write-Host "  -MaxRetryAfterSeconds <n>               Max server Retry-After wait honoured (default: 300, 0 = ignore)"
-    Write-Host "  -ConnectionLimit <n>                    .NET HTTP connection limit (default: 100)"
+    Write-Host "  -ConnectionLimit <n>                    .NET HTTP connection limit, Windows PowerShell 5.1 only (default: 100)"
     Write-Host "  -FileWriteRetryCount <n>                Append retry attempts for output/log/progress files (default: 5)"
     Write-Host "  -FileWriteRetryDelayMinMs <n>           Min delay between append retries (default: 50)"
     Write-Host "  -FileWriteRetryDelayMaxMs <n>           Max delay between append retries (default: 300)"
@@ -729,10 +848,10 @@ function Show-Usage {
     Write-Host "Examples -- include and exclude wildcard patterns:"
     Write-Host ""
     Write-Host "  Save links containing download OR game, but exclude demo and trailer links:"
-    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*download*`",`"*game*`" -ExcludePatterns `"*demo*`",`"*trailer*`" -OutputFile `"matched.txt`" Append File"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*download*`",`"*game*`" -ExcludePatterns `"*demo*`",`"*trailer*`" -OutputFile `"matched.txt`" -Mode Append -SourceType File"
     Write-Host ""
     Write-Host "  Save links containing BOTH amiga AND lha, but exclude links containing beta:"
-    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*amiga*`",`"*lha*`" -SearchMode All -ExcludePattern `"*beta*`" -OutputFile `"matched.txt`" Append File"
+    Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" -SearchPatterns `"*amiga*`",`"*lha*`" -SearchMode All -ExcludePattern `"*beta*`" -OutputFile `"matched.txt`" -Mode Append -SourceType File"
     Write-Host ""
     Write-Host "  Exclude only when BOTH unwanted words are present in the same link:"
     Write-Host "  .\AE-Find-WebLinks.ps1 `"urls.txt`" `"*download*`" `"matched.txt`" Append File -ExcludePatterns `"*demo*`",`"*trial*`" -ExcludeMode All"
@@ -815,6 +934,38 @@ function Show-Usage {
     Write-Host "  JavaScript, so content rendered entirely by client-side JS (React,"
     Write-Host "  Vue, Angular SPAs, etc.) will not be visible. It does extract URLs"
     Write-Host "  embedded in <script> blocks, JSON, CSS, and <noscript> fallbacks."
+    Write-Host ""
+    Write-Host "Parallel processing:"
+    Write-Host "  -ThrottleLimit 4 fetches four URLs at a time (File mode and crawl mode). Workers only"
+    Write-Host "  download and extract; matching, writing, logging, progress, and crawl scheduling stay"
+    Write-Host "  on the main thread, so output files are never written concurrently. -DelaySeconds and"
+    Write-Host "  -DelayJitterSeconds then space out request starts across the pool. Requires PowerShell 7"
+    Write-Host "  or later (pwsh); Windows PowerShell 5.1 runs sequentially and rejects -ThrottleLimit > 1"
+    Write-Host "  with an explanation. Exact result order differs between runs; the result set does not."
+    Write-Host ""
+    Write-Host "Platform notes:"
+    Write-Host "  Runtime requirements: Windows PowerShell 5.1 or PowerShell 7+; parallel needs 7+."
+    Write-Host "  Validation scope: Windows x64, FullLanguage, PowerShell 7.6.6 Core and"
+    Write-Host "  Windows PowerShell 5.1.26100.9444 Desktop. See the release notes for evidence/status."
+    Write-Host "  Other PS7 versions, Linux/macOS, ARM and x86 are not validated by this release."
+    Write-Host "  Enterprise proxy/PAC and TLS interception require deployment-specific validation."
+    Write-Host "  Requests use request-local .NET transports: HttpWebRequest on 5.1, HttpClient on 7+."
+    Write-Host "  Each attempt deadline covers response headers and the body, including slow trickles."
+    Write-Host "  -SkipCertificateCheck is request-local. -ConnectionLimit applies to the 5.1 transport;"
+    Write-Host "  PowerShell 7 HttpClient manages its own connections and TLS negotiation."
+    Write-Host ""
+    Write-Host "Exit codes:"
+    Write-Host "  0 = normal command completion; may also occur after native-host Ctrl+C."
+    Write-Host "  1 = runtime/URL failure; 2 = incomplete extraction command;"
+    Write-Host "  3 = stopped by -MaxRunMinutes (saved progress retained where enabled)."
+    Write-Host "  130 = script cancellation handler ran; the native host may instead stop with exit 0."
+    Write-Host ""
+    Write-Host "Cancellation and completion:"
+    Write-Host "  With direct powershell.exe -File or pwsh -File, Ctrl+C can return 0 before completion."
+    Write-Host "  Do not use exit 0 alone as proof of completion after interruption."
+    Write-Host "  For File/crawl runs, preserve saved progress and resume with the same inputs/settings."
+    Write-Host "  Verify intended sources against the CSV and output; a missing checkpoint alone proves nothing."
+    Write-Host "  Recovery was observed at specific interruption points, not every possible write boundary."
     Write-Host ""
     Write-Host "Security note:"
     Write-Host "  The script blocks private/internal source and redirect URLs as an SSRF"
@@ -1175,10 +1326,10 @@ function Edit-RunOptionalSettings {
             "Finish and generate command" { return }
 
             "Resume, blacklist, logging, and files" {
-                if ($SourceType -eq "File") {
-                    Set-OptionalSwitchValue -Settings $Settings -Name "Resume" -Prompt "Is this a resume run from an existing progress file?" -Default $false
-                    Set-OptionalTextValue -Settings $Settings -Name "ProgressFile" -Prompt "Custom progress file path? Leave blank for <OutputFile>.progress"
-                }
+                # Progress/resume applies to File mode and to crawl mode (any source type).
+                Set-OptionalSwitchValue -Settings $Settings -Name "Resume" -Prompt "Is this a resume run from an existing progress file? (File mode or crawl mode)" -Default $false
+                Set-OptionalTextValue -Settings $Settings -Name "ProgressFile" -Prompt "Custom progress file path? Leave blank for <OutputFile>.progress / <OutputFile>.crawl.progress"
+                Set-OptionalSwitchValue -Settings $Settings -Name "RetryFailedOnFinish" -Prompt "After the run, automatically retry failed URLs once with -Resume?" -Default $false
 
                 $blacklistText = Read-InteractiveText -Prompt "Blacklist file(s), comma-separated? Leave blank for none"
                 $blacklist = @(Convert-InteractiveList $blacklistText)
@@ -1198,6 +1349,7 @@ function Edit-RunOptionalSettings {
                 }
 
                 Set-OptionalSwitchValue -Settings $Settings -Name "KeepFragments" -Prompt "Keep URL fragments (#...) when deduplicating?" -Default $false
+                Set-OptionalSwitchValue -Settings $Settings -Name "Quiet" -Prompt "Quiet console output (one line per URL plus failures and totals)?" -Default $false
 
                 $stripEvaluationRegex = Read-InteractiveYesNo -Prompt "Strip a regex-matched part from extracted links before matching/output/deduplication?" -Default $false
                 if ($stripEvaluationRegex) {
@@ -1214,7 +1366,16 @@ function Edit-RunOptionalSettings {
                 Set-OptionalIntValue -Settings $Settings -Name "StuckUrlTimeoutSeconds" -Prompt "Same-link watchdog seconds. 0 = disabled" -Default 300 -Minimum 0
                 if ($SourceType -eq "File") {
                     Set-OptionalIntValue -Settings $Settings -Name "DelaySeconds" -Prompt "Seconds between different source URLs" -Default 5
-                    Set-OptionalIntValue -Settings $Settings -Name "ThrottleLimit" -Prompt "Parallel source URLs. 1 = sequential. PS 7+ required above 1" -Default 1 -Minimum 1
+                }
+                Set-OptionalIntValue -Settings $Settings -Name "DelayJitterSeconds" -Prompt "Random extra 0..n seconds added to each wait between URLs. 0 = none" -Default 0
+                Set-OptionalIntValue -Settings $Settings -Name "ThrottleLimit" -Prompt "URLs fetched at the same time in File/crawl mode. 1 = sequential; above 1 needs PowerShell 7+" -Default 1 -Minimum 1
+                Set-OptionalIntValue -Settings $Settings -Name "MaxRunMinutes" -Prompt "Stop starting new URLs after this many minutes and keep progress for -Resume. 0 = no limit" -Default 0
+                Set-OptionalChoiceValue -Settings $Settings -Name "DefaultScheme" -Prompt "Scheme for bare hosts like example.com/path?" -Choices @("https", "http") -DefaultIndex 0
+                Set-OptionalSwitchValue -Settings $Settings -Name "SkipCertificateCheck" -Prompt "Skip TLS certificate validation (expired/self-signed certificates)?" -Default $false
+                $headerText = Read-InteractiveText -Prompt "Extra request headers as Name: value, comma-separated? Example: Referer: https://x.test, Cookie: a=b. Leave blank for none"
+                $headerList = @(Convert-InteractiveList $headerText)
+                if ($headerList.Count -gt 0) {
+                    $Settings["Header"] = $headerList
                 }
                 Set-OptionalBoolValue -Settings $Settings -Name "SecondFetch" -Prompt "Fetch each URL twice and keep the larger response?" -Default $true
                 if ($Settings.ContainsKey("SecondFetch") -and [bool]$Settings["SecondFetch"]) {
@@ -1336,7 +1497,7 @@ function New-RunCommandFromInteractiveAnswers {
     # Append standard string settings
     foreach ($name in @(
         "BlacklistScope", "FollowScope", "FollowPathScope", "LogMode", "FailedUrlMode", "SortDirection", "DeduplicateWhen", "SortWhen",
-        "Proxy", "UserAgent", "RobotsUserAgent", "ProgressFile", "LogCsv", "FailedUrlFile", "LinkEvaluationStripRegex"
+        "Proxy", "UserAgent", "RobotsUserAgent", "ProgressFile", "LogCsv", "FailedUrlFile", "LinkEvaluationStripRegex", "DefaultScheme"
     )) {
         if ($Settings.ContainsKey($name)) {
             Add-CommandValue -Parts $parts -Name $name -Value $Settings[$name]
@@ -1344,7 +1505,7 @@ function New-RunCommandFromInteractiveAnswers {
     }
 
     # Append list settings
-    foreach ($name in @("BlacklistFile")) {
+    foreach ($name in @("BlacklistFile", "Header")) {
         if ($Settings.ContainsKey($name)) {
             Add-CommandValue -Parts $parts -Name $name -Value $Settings[$name]
         }
@@ -1353,7 +1514,7 @@ function New-RunCommandFromInteractiveAnswers {
     # Append Integer settings
     foreach ($name in @(
         "RetryCount", "WaitSeconds", "TimeoutSeconds", "StuckUrlTimeoutSeconds", "DelaySeconds", "FollowDepth", "MaxSubdomainDepth", "MaxFollowPages",
-        "SecondFetchWait", "ThrottleLimit", "MaxRedirects", "MaxRetryAfterSeconds", "ConnectionLimit", "MaintenanceLargeFileLimitMB",
+        "SecondFetchWait", "ThrottleLimit", "MaxRunMinutes", "DelayJitterSeconds", "MaxRedirects", "MaxRetryAfterSeconds", "ConnectionLimit", "MaintenanceLargeFileLimitMB",
         "MaxPageContentMB", "RegexTimeoutSeconds", "MaxUrlLength", "FileWriteRetryCount",
         "FileWriteRetryDelayMinMs", "FileWriteRetryDelayMaxMs", "FileMoveRetryCount", "FileMoveRetryDelayMs",
         "HighFailureRatePercent"
@@ -1373,7 +1534,7 @@ function New-RunCommandFromInteractiveAnswers {
     # Append Switch settings
     foreach ($name in @(
         "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments", "StripRegexBeforeEvaluation", "EnforceRobotsTxt", "FollowUntilExhausted",
-        "RetryFailedOnFinish", "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues"
+        "RetryFailedOnFinish", "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues", "SkipCertificateCheck", "Quiet"
     )) {
         if ($Settings.ContainsKey($name)) {
             Add-CommandSwitch -Parts $parts -Name $name -Enabled $Settings[$name]
@@ -1381,6 +1542,100 @@ function New-RunCommandFromInteractiveAnswers {
     }
 
     return ($parts -join " ")
+}
+
+# Switch parameters are only passed when enabled; everything else is passed as
+# the typed value the prompts collected. The same hashtable that runs the command
+# is what the printed command string describes, so the two cannot disagree.
+$Script:InteractiveSwitchNames = @(
+    "Resume", "KeepDuplicates", "DeduplicateFiles", "KeepFragments", "StripRegexBeforeEvaluation", "EnforceRobotsTxt", "FollowUntilExhausted",
+    "RetryFailedOnFinish", "IgnoreMaintenanceLargeFileLimit", "AllowExtremeOperationalValues", "SkipCertificateCheck", "Quiet"
+)
+
+function ConvertTo-SettingsParameters {
+    param([Parameter(Mandatory = $true)][hashtable]$Settings)
+
+    $params = @{}
+    foreach ($entry in $Settings.GetEnumerator()) {
+        $value = $entry.Value
+        if ($null -eq $value) { continue }
+        if ($Script:InteractiveSwitchNames -contains $entry.Key) {
+            if ([bool]$value) { $params[$entry.Key] = $true }
+            continue
+        }
+        if ($value -is [string] -and [string]::IsNullOrWhiteSpace($value)) { continue }
+        if ($value -is [array] -and $value.Count -eq 0) { continue }
+        $params[$entry.Key] = $value
+    }
+    return $params
+}
+
+function ConvertTo-RunParameters {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string[]]$SearchPatternsValue,
+        [Parameter(Mandatory = $true)][string]$SearchModeValue,
+        [AllowNull()][string[]]$ExcludePatternsValue,
+        [AllowNull()][string]$ExcludeModeValue,
+        [Parameter(Mandatory = $true)][string]$OutputFileValue,
+        [Parameter(Mandatory = $true)][string]$ModeValue,
+        [Parameter(Mandatory = $true)][string]$SourceTypeValue,
+        [Parameter(Mandatory = $true)][hashtable]$Settings
+    )
+
+    $params = ConvertTo-SettingsParameters -Settings $Settings
+    $params["Source"] = $Source
+    $params["OutputFile"] = $OutputFileValue
+    $params["Mode"] = $ModeValue
+    $params["SourceType"] = $SourceTypeValue
+
+    if ($SearchPatternsValue.Count -eq 1) { $params["SearchPattern"] = $SearchPatternsValue[0] }
+    else { $params["SearchPatterns"] = [string[]]$SearchPatternsValue }
+    if ($SearchPatternsValue.Count -gt 1 -or $SearchModeValue -ne "Any") { $params["SearchMode"] = $SearchModeValue }
+
+    if ($ExcludePatternsValue -and $ExcludePatternsValue.Count -gt 0) {
+        if ($ExcludePatternsValue.Count -eq 1) { $params["ExcludePattern"] = $ExcludePatternsValue[0] }
+        else { $params["ExcludePatterns"] = [string[]]$ExcludePatternsValue }
+        if (-not [string]::IsNullOrWhiteSpace($ExcludeModeValue)) { $params["ExcludeMode"] = $ExcludeModeValue }
+    }
+
+    return $params
+}
+
+# After a command has been generated: optionally save it as a .ps1 and/or run it
+# immediately with the collected parameters. Returns $true when it ran.
+function Invoke-GeneratedCommandOffer {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][hashtable]$Parameters
+    )
+
+    $savePath = Read-InteractiveText -Prompt "Save this command to a .ps1 file? Enter a path, or leave blank to skip"
+    if (-not [string]::IsNullOrWhiteSpace($savePath)) {
+        try {
+            Set-Content -LiteralPath $savePath -Value @(
+                "# Generated by AE-Find-WebLinks $($Script:ScriptVersion) interactive builder on $((Get-Date).ToString('yyyy-MM-dd HH:mm'))"
+                "# Run from the folder that contains AE-Find-WebLinks.ps1, or adjust the path below."
+                $CommandLine
+            ) -Encoding UTF8
+            Write-Host "Saved: $savePath" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Could not save the command to '$savePath': $($_.Exception.Message)"
+        }
+    }
+
+    if (-not (Read-InteractiveYesNo -Prompt "Run this command now?" -Default $false)) {
+        return $false
+    }
+
+    Write-Host ""
+    Write-Host "Running now with the parameters above ..." -ForegroundColor Green
+    Write-Host ""
+    $global:LASTEXITCODE = 0
+    & $PSCommandPath @Parameters
+    $childExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    exit $childExitCode
 }
 
 function Start-InteractiveRunCommandBuilder {
@@ -1433,12 +1688,26 @@ function Start-InteractiveRunCommandBuilder {
         -SourceTypeValue $sourceTypeValue `
         -Settings $settings
 
+    $runParameters = ConvertTo-RunParameters `
+        -Source $sourceValue `
+        -SearchPatternsValue $searchPatternsValue `
+        -SearchModeValue $searchModeValue `
+        -ExcludePatternsValue $excludePatternsValue `
+        -ExcludeModeValue $excludeModeValue `
+        -OutputFileValue $outputFileValue `
+        -ModeValue $modeValue `
+        -SourceTypeValue $sourceTypeValue `
+        -Settings $settings
+
     Write-Host ""
     Write-Host "Generated command:" -ForegroundColor Green
     Write-Host ""
     Write-Host $commandLine -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Nothing was executed. Copy and run the command above when ready."
+
+    if (-not (Invoke-GeneratedCommandOffer -CommandLine $commandLine -Parameters $runParameters)) {
+        Write-Host "Nothing was executed. Copy and run the command above when ready."
+    }
 }
 
 function New-MaintenanceCommandFromInteractiveAnswers {
@@ -1522,18 +1791,25 @@ function Start-InteractiveMaintenanceCommandBuilder {
 
     $commandLine = New-MaintenanceCommandFromInteractiveAnswers -CommandValue $commandValue -FilesValue $filesValue -Settings $settings
 
+    $maintenanceParameters = ConvertTo-SettingsParameters -Settings $settings
+    $maintenanceParameters["Command"] = $commandValue
+    $maintenanceParameters["Files"] = [string[]]$filesValue
+
     Write-Host ""
     Write-Host "Generated command:" -ForegroundColor Green
     Write-Host ""
     Write-Host $commandLine -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Nothing was executed. Copy and run the command above when ready."
+
+    if (-not (Invoke-GeneratedCommandOffer -CommandLine $commandLine -Parameters $maintenanceParameters)) {
+        Write-Host "Nothing was executed. Copy and run the command above when ready."
+    }
 }
 
 function Start-InteractiveHelp {
     Write-Host ""
-    Write-Host "AE-Find-WebLinks guided helper"
-    Write-Host "It asks questions and prints the command to run. It does not run the command."
+    Write-Host "AE-Find-WebLinks $($Script:ScriptVersion) guided helper on $($Script:HostDescription)"
+    Write-Host "It asks questions, prints the command, and can save it to a file or run it for you."
 
     $modeChoice = Read-InteractiveChoice -Prompt "What do you want help building?" -Choices @("Run / scrape links", "Maintenance only") -DefaultIndex 0
 
@@ -1549,6 +1825,11 @@ function Start-InteractiveHelp {
 # SCRIPT ENTRY GATES
 # Checks if we should exit early to display help rather than running the engine
 # ==============================================================================
+
+if ($Version) {
+    Write-Host "AE-Find-WebLinks $($Script:ScriptVersion) on $($Script:HostDescription)"
+    exit 0
+}
 
 if ($Help) {
     Show-Usage
@@ -1593,14 +1874,88 @@ if ($Command -eq "Run" -and (
     ) -or
     [string]::IsNullOrWhiteSpace($OutputFile)
 )) {
+    Write-Host 'Invalid extraction command: Source, OutputFile and at least one search pattern are required.' -ForegroundColor Red
     Show-Usage
-    exit 0
+    exit 2
 }
 
 # ---------------------------------------------------------------------------
 # CORE HELPERS
 # Path resolution, object disposal, and error identification
 # ---------------------------------------------------------------------------
+
+# Helper: console detail lines that -Quiet suppresses (per-attempt, redirect,
+# content-length, waiting, and enqueue chatter). Per-URL headlines, failures,
+# warnings, and totals always print.
+function Write-Detail {
+    param([AllowNull()][string]$Message)
+    if (-not $Script:QuietMode) { Write-Host $Message }
+}
+
+# Helper: is -ThrottleLimit > 1 usable on this PowerShell? Pure function so the
+# decision can be tested with any version/edition combination.
+function Test-ParallelSupport {
+    param(
+        [int]$RequestedThrottleLimit = 1,
+        [int]$MajorVersion = $Script:PSMajorVersion,
+        [string]$EditionName = $Script:PSEditionName
+    )
+
+    if ($RequestedThrottleLimit -le 1) {
+        return [pscustomobject]@{ Supported = $true; Reason = "Sequential processing (-ThrottleLimit 1)." }
+    }
+
+    if ($MajorVersion -ge 7) {
+        return [pscustomobject]@{ Supported = $true; Reason = "PowerShell $MajorVersion ($EditionName edition) supports parallel processing." }
+    }
+
+    $flavour = if ($EditionName -ieq "Desktop") {
+        "Windows PowerShell $MajorVersion.x (Desktop edition)"
+    }
+    else {
+        "PowerShell $MajorVersion ($EditionName edition)"
+    }
+
+    return [pscustomobject]@{
+        Supported = $false
+        Reason    = "-ThrottleLimit $RequestedThrottleLimit needs PowerShell 7 or later, but this is $flavour. Install PowerShell 7 (on Windows: winget install Microsoft.PowerShell, or https://aka.ms/powershell) and run the script with pwsh, e.g. pwsh -File .\AE-Find-WebLinks.ps1 ..., or use -ThrottleLimit 1 to run sequentially on this version."
+    }
+}
+
+# Helper: -MaxRunMinutes. Returns $true once the deadline has passed; the first
+# time it also explains what happens next.
+function Test-RunDeadlineReached {
+    if ($null -eq $Script:RunDeadline) { return $false }
+    if ((Get-Date) -lt $Script:RunDeadline) { return $false }
+
+    if (-not $Script:RunDeadlineHit) {
+        $Script:RunDeadlineHit = $true
+        Write-Warning "Run time limit of $MaxRunMinutes minute(s) reached. No further URLs will be started. The progress file is kept; re-run the same command with -Resume to continue."
+    }
+
+    return $true
+}
+
+# Helper: wait between URLs (-DelaySeconds plus optional -DelayJitterSeconds).
+function Get-InterUrlDelaySeconds {
+    param([int]$BaseSeconds)
+
+    $total = [double][Math]::Max(0, $BaseSeconds)
+    if ($Script:DelayJitterSecondsValue -gt 0) {
+        $total += Get-Random -Minimum 0.0 -Maximum ([double]$Script:DelayJitterSecondsValue)
+    }
+    return $total
+}
+
+function Start-InterUrlDelay {
+    param([int]$BaseSeconds)
+
+    $total = Get-InterUrlDelaySeconds -BaseSeconds $BaseSeconds
+    if ($total -le 0) { return }
+
+    Write-Detail ("  Waiting {0:0.#} second(s) before next URL ..." -f $total)
+    Start-Sleep -Milliseconds ([int][Math]::Min([double]([int]::MaxValue - 1), [Math]::Ceiling($total * 1000.0)))
+}
 
 # Helper: Converts a relative path into an absolute file path robustly
 function Get-SafeAbsolutePath {
@@ -1657,6 +2012,17 @@ function Test-IsCancellationException {
 
     if ($null -eq $ErrorObject) { return $false }
 
+    # PowerShell 7's Invoke-WebRequest reports an HTTP timeout as a
+    # TaskCanceledException (FQEID ConnectionTimeoutReached, inner
+    # TimeoutException). That is a per-request failure that must go through
+    # the normal retry/failed-URL path, not a user interrupt.
+    if (
+        $ErrorObject -is [System.Management.Automation.ErrorRecord] -and
+        $ErrorObject.FullyQualifiedErrorId -like 'ConnectionTimeoutReached*'
+    ) {
+        return $false
+    }
+
     $ex = if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) {
         $ErrorObject.Exception
     }
@@ -1665,6 +2031,12 @@ function Test-IsCancellationException {
     }
     else {
         $ErrorObject
+    }
+
+    $chain = $ex
+    while ($null -ne $chain) {
+        if ($chain -is [System.TimeoutException]) { return $false }
+        $chain = $chain.InnerException
     }
 
     while ($null -ne $ex) {
@@ -1727,6 +2099,9 @@ function Test-IsStuckUrlTimeoutError {
     }
     elseif ($ErrorObject.PSObject.Properties['Exception']) {
         $ErrorObject.Exception.Message
+    }
+    elseif ($ErrorObject -is [System.Exception]) {
+        $ErrorObject.Message
     }
     else {
         [string]$ErrorObject
@@ -1827,7 +2202,7 @@ function Get-LinkEvaluationValue {
     param([AllowNull()][string]$Link)
 
     if ([string]::IsNullOrWhiteSpace($Link)) { return $Link }
-    if (-not $Script:StripRegexBeforeEvaluation -or $null -eq $Script:LinkEvaluationStripRegexObject) { return $Link }
+    if (-not $Script:StripRegexBeforeEvaluationEnabled -or $null -eq $Script:LinkEvaluationStripRegexObject) { return $Link }
 
     $candidate = $Link.Trim()
 
@@ -2048,7 +2423,9 @@ function Get-LinkWriteValue {
         if ($uri.IsAbsoluteUri) {
             $builder = [System.UriBuilder]::new($uri)
             $builder.Fragment = ""
-            return $builder.Uri.ToString()
+            # AbsoluteUri keeps percent-encoding; Uri.ToString() unescapes it
+            # (%20 becomes a literal space), which corrupts written URLs.
+            return $builder.Uri.AbsoluteUri
         }
     }
     catch {
@@ -2292,13 +2669,13 @@ function Test-HostLooksInternalWithoutDns {
     $hostClean = $HostName.Trim().Trim([char[]]@('[', ']')).TrimEnd('.').ToLowerInvariant()
     if ([string]::IsNullOrWhiteSpace($hostClean)) { return $true }
     if ($hostClean -ieq 'localhost') { return $true }
-    if ($hostClean -notmatch '\.') { return $true }
     if ($hostClean -match '(?i)(^|\.)(localhost|local|internal|lan)$' -or $hostClean -match '(?i)\.home\.arpa$') { return $true }
 
     $parsedIp = [System.Net.IPAddress]::None
     if ([System.Net.IPAddress]::TryParse($hostClean, [ref]$parsedIp)) {
         return (Test-IsPrivateIPAddress -IPAddress $parsedIp)
     }
+    if ($hostClean -notmatch '\.') { return $true }
 
     return $false
 }
@@ -2512,7 +2889,8 @@ function Initialize-ProgressFile {
         [switch]$Resume
     )
 
-    # Use ConcurrentDictionary for thread-safety in ThrottleLimit > 1 situations
+    # Case-insensitive set of completed source URL keys (kept as a dictionary
+    # so TryAdd/ContainsKey work identically on PS 5.1 and 7).
     $completed = [System.Collections.Concurrent.ConcurrentDictionary[string, byte]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
     )
@@ -2524,11 +2902,11 @@ function Initialize-ProgressFile {
             Write-Host "Progress file is empty (likely from a crash). Removing and starting fresh."
             Remove-Item -LiteralPath $Path -Force
 
-            Set-Content -LiteralPath $Path -Value @(
+            Set-Utf8NoBomFile -FilePath $Path -Lines @(
                 "# AE-Find-WebLinks progress file"
                 "# Signature: $Signature"
                 "# One completed source URL key per line"
-            ) -Encoding UTF8
+            )
 
             Write-Host "Progress file recreated: $Path"
         }
@@ -2584,11 +2962,11 @@ function Initialize-ProgressFile {
             [void](New-Item -ItemType Directory -Path $folder -Force)
         }
 
-        Set-Content -LiteralPath $Path -Value @(
+        Set-Utf8NoBomFile -FilePath $Path -Lines @(
             "# AE-Find-WebLinks progress file"
             "# Signature: $Signature"
             "# One completed source URL key per line"
-        ) -Encoding UTF8
+        )
 
         if ($Resume) {
             Write-Host "Resume requested, but no progress file exists yet. Starting a new resumable run."
@@ -2787,12 +3165,12 @@ function Initialize-CrawlProgressFile {
             [void](New-Item -ItemType Directory -Path $folder -Force)
         }
 
-        Set-Content -LiteralPath $Path -Value @(
+        Set-Utf8NoBomFile -FilePath $Path -Lines @(
             "# AE-Find-WebLinks crawl progress file"
             "# Signature: $Signature"
             "# ENQUEUED<TAB>Depth<TAB>Base64Url"
             "# DONE<TAB>Base64UrlKey"
-        ) -Encoding UTF8
+        )
 
         if ($Resume) {
             Write-Host "Resume requested, but no crawl progress file exists yet. Starting a new resumable crawl."
@@ -2884,12 +3262,14 @@ function Invoke-RetryFailedOnFinishPass {
     Write-Host "--- RetryFailedOnFinish: starting one resume pass for failed/unfinished URLs ---"
     Write-Host "Progress file: $ProgressFilePath"
 
+    # Clear inherited native status before invocation, then preserve the exact
+    # resume result. A deadline (3) or interruption (130) is not generic failure.
+    $global:LASTEXITCODE = 0
     & $ScriptPath @retryParams
-
-    if (-not $?) {
-        exit 1
-    }
-
+    $resumeSucceeded = $?
+    $resumeExitCode = $global:LASTEXITCODE
+    if ($resumeExitCode -ne 0) { exit ([int]$resumeExitCode) }
+    if (-not $resumeSucceeded) { exit 1 }
     exit 0
 }
 
@@ -2916,6 +3296,32 @@ function Start-FileRetryDelay {
     }
 }
 
+# Encoding.UTF8 emits a byte-order mark when it starts a new/empty file, so
+# every fresh output, log, progress, and failed-URL file began with EF BB BF.
+# The script tolerates its own BOM, but download tools fed the output list do
+# not (the first URL becomes "\uFEFFhttp://..."). Write plain UTF-8 instead.
+$Script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+function Set-Utf8NoBomFile {
+    param([Parameter(Mandatory=$true)][string]$FilePath,
+          [AllowNull()][AllowEmptyCollection()][string[]]$Lines = @())
+    $nativePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($FilePath)
+    for ($attempt = 1; $attempt -le $Script:FileWriteRetryCount; $attempt++) {
+        try {
+            if ($null -eq $Lines -or $Lines.Count -eq 0) {
+                [IO.File]::WriteAllText($nativePath, '', $Script:Utf8NoBom)
+            } else {
+                [IO.File]::WriteAllLines($nativePath, $Lines, $Script:Utf8NoBom)
+            }
+            return
+        } catch [System.UnauthorizedAccessException] { throw }
+          catch [System.IO.IOException] {
+            if ($attempt -eq $Script:FileWriteRetryCount) { throw }
+            Start-FileRetryDelay -MinimumMilliseconds $Script:FileWriteRetryDelayMinMs -MaximumMilliseconds $Script:FileWriteRetryDelayMaxMs
+        }
+    }
+}
+
 function Write-FileWithRetry {
     param(
         [string]$FilePath,
@@ -2924,7 +3330,7 @@ function Write-FileWithRetry {
     $maxAttempts = $Script:FileWriteRetryCount
     for ($i = 1; $i -le $maxAttempts; $i++) {
         try {
-            [System.IO.File]::AppendAllText($FilePath, "$Content`n", [System.Text.Encoding]::UTF8)
+            [System.IO.File]::AppendAllText($FilePath, "$Content`n", $Script:Utf8NoBom)
             return
         }
         catch [System.UnauthorizedAccessException] {
@@ -2945,7 +3351,7 @@ function Write-FileLinesWithRetry {
     $maxAttempts = $Script:FileWriteRetryCount
     for ($i = 1; $i -le $maxAttempts; $i++) {
         try {
-            [System.IO.File]::AppendAllLines($FilePath, $Lines, [System.Text.Encoding]::UTF8)
+            [System.IO.File]::AppendAllLines($FilePath, $Lines, $Script:Utf8NoBom)
             return
         }
         catch [System.UnauthorizedAccessException] {
@@ -3111,7 +3517,7 @@ function Remove-FileDuplicatesFast {
     $writeSucceeded = $false
     try {
         $reader = [System.IO.StreamReader]::new($safePath, [System.Text.Encoding]::UTF8)
-        $writer = [System.IO.StreamWriter]::new($tempFile, $false, [System.Text.Encoding]::UTF8)
+        $writer = [System.IO.StreamWriter]::new($tempFile, $false, $Script:Utf8NoBom)
         $duplicatesRemoved = 0
         $linesKept = 0
 
@@ -3130,7 +3536,7 @@ function Remove-FileDuplicatesFast {
             # Use Get-LinkKey for URL-aware dedup (respects -KeepFragments)
             $key = Get-LinkKey -Link $trimmed -KeepFragments $KeepFragments
             if ([string]::IsNullOrWhiteSpace($key)) {
-                # Not a valid URL — keep as-is using raw string dedup
+                # Not a valid URL - keep as-is using raw string dedup
                 $key = $trimmed
             }
 
@@ -3235,7 +3641,7 @@ function Sort-FileFast {
     $writer = $null
     $writeSucceeded = $false
     try {
-        $writer = [System.IO.StreamWriter]::new($tempFile, $false, [System.Text.Encoding]::UTF8)
+        $writer = [System.IO.StreamWriter]::new($tempFile, $false, $Script:Utf8NoBom)
         # Write comments first (preserve headers)
         foreach ($c in $comments) { $writer.WriteLine($c) }
         # Then sorted content
@@ -3542,10 +3948,10 @@ function Test-IsPrivateUrl {
         # Resolve DNS to catch public-looking names that map to internal IPs.
         # Use the async DNS API with a hard wait timeout. The synchronous
         # GetHostAddresses() call ignores -TimeoutSeconds entirely and blocks the
-        # worker thread on the OS resolver default (often 15-30s) when a hostile
-        # or broken authoritative server stalls the response. With ThrottleLimit
-        # > 1 a handful of tarpit URLs in a source list could otherwise consume
-        # every worker. Wait() returning false abandons our wait but does not
+        # script on the OS resolver default (often 15-30s) when a hostile or
+        # broken authoritative server stalls the response; a handful of tarpit
+        # URLs in a source list could otherwise stall a long run for minutes.
+        # Wait() returning false abandons our wait but does not
         # cancel the task -- the OS resolver call continues until it gives up
         # naturally. We treat timeout as "non-resolvable, fail open" because the
         # subsequent web request honours -TimeoutSeconds and will fail cleanly.
@@ -3809,19 +4215,19 @@ function ConvertTo-NormalizedLink {
 
     # Protocol-relative (e.g., //example.com/script.js)
     if ($link -match '^//') {
-        $candidate = if ($null -ne $BaseUri) { "$($BaseUri.Scheme):$link" } else { "https:$link" }
+        $candidate = if ($null -ne $BaseUri) { "$($BaseUri.Scheme):$link" } else { "$($Script:BareHostScheme):$link" }
         return (ConvertTo-NormalizedLink -Link $candidate)
     }
 
     # Bare www
-    if ($link -match '^www\.') { return (ConvertTo-NormalizedLink -Link "https://$link") }
+    if ($link -match '^www\.') { return (ConvertTo-NormalizedLink -Link "$($Script:BareHostScheme)://$link") }
 
     # Relative asset filename. Resolve this before the bare-domain rule because
     # some valid file extensions also exist as modern TLDs (.js, .zip, .mov, etc.).
     if ($null -ne $BaseUri -and (Test-IsLikelyRelativeAssetPath -Link $link)) {
         try {
             $absolute = [uri]::new($BaseUri, $link)
-            if ($absolute.Scheme -match '^https?$') { return (Limit-NormalizedLinkLength -Link $absolute.ToString()) }
+            if ($absolute.Scheme -match '^https?$') { return (Limit-NormalizedLinkLength -Link $absolute.AbsoluteUri) }
         }
         catch { return $null }
     }
@@ -3834,14 +4240,14 @@ function ConvertTo-NormalizedLink {
     # value is fed in directly. Inside RegexRawUrl the lookbehind blocks the
     # same pattern when it appears as part of a path or word-boundary context.
     if ($link -match '^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}(:\d+)?([/?#].*)?$') {
-        return (ConvertTo-NormalizedLink -Link "https://$link")
+        return (ConvertTo-NormalizedLink -Link "$($Script:BareHostScheme)://$link")
     }
 
     # Relative link (e.g. /path/to/page.html)
     if ($null -ne $BaseUri) {
         try {
             $absolute = [uri]::new($BaseUri, $link)
-            if ($absolute.Scheme -match '^https?$') { return (Limit-NormalizedLinkLength -Link $absolute.ToString()) }
+            if ($absolute.Scheme -match '^https?$') { return (Limit-NormalizedLinkLength -Link $absolute.AbsoluteUri) }
         }
         catch { return $null }
     }
@@ -4042,6 +4448,45 @@ function Add-FoundLinkCandidate {
 }
 
 
+# A URL occurrence is a source-text span, NOT a URL value. Different scanners
+# can discover the same span. Separate occurrences with identical values must
+# remain separate for -KeepDuplicates, including two entries in one srcset.
+function Add-FoundLinkOccurrence {
+    param(
+        [AllowEmptyCollection()][System.Collections.Generic.List[object]]$Occurrences,
+        [AllowNull()][string]$Value,
+        [int]$StartIndex,
+        [int]$Length,
+        [switch]$Srcset
+    )
+    if ($null -eq $Occurrences) { throw 'Internal error: missing occurrence collection.' }
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Length -le 0) { return }
+    [void]$Occurrences.Add([pscustomobject]@{
+        Start = $StartIndex; Length = $Length; Value = $Value
+        Srcset = [bool]$Srcset; Sequence = $Occurrences.Count
+    })
+}
+
+function Get-UniqueLinkOccurrenceValues {
+    param([AllowEmptyCollection()][System.Collections.Generic.List[object]]$Occurrences)
+    if ($null -eq $Occurrences -or $Occurrences.Count -eq 0) { return @() }
+    $selected = [System.Collections.Generic.List[object]]::new()
+    $coveredEnd = -1
+    # At the same start prefer the full source span, then the earlier (specialized)
+    # scanner. An inner raw match is not a second occurrence of its parent URL.
+    $ordered = @($Occurrences.ToArray() | Sort-Object @{Expression='Start';Ascending=$true}, @{Expression='Length';Descending=$true}, @{Expression='Sequence';Ascending=$true})
+    foreach ($item in $ordered) {
+        if ($item.Start -lt $coveredEnd) { continue }
+        [void]$selected.Add($item)
+        $coveredEnd = $item.Start + $item.Length
+    }
+    $values = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @($selected.ToArray() | Sort-Object Sequence)) {
+        Add-FoundLinkCandidate -List $values -Value $item.Value -Srcset:([bool]$item.Srcset)
+    }
+    return @($values.ToArray())
+}
+
 function Get-NormalizedUrlCandidatesFromText {
     param(
         [AllowNull()]
@@ -4069,6 +4514,11 @@ function Get-NormalizedUrlCandidatesFromText {
         $candidate = $candidate.Trim([char[]]@(' ', "`t", '"', "'", '<', '>', '[', ']', '(', ')', '{', '}', ',', ';', '|'))
         if ([string]::IsNullOrWhiteSpace($candidate)) { return }
 
+        # A URL never contains raw whitespace. [uri] silently escapes it, so
+        # without this check a line such as "url1 , url2" also produced a third
+        # bogus candidate "url1%20,%20url2" that was then fetched and failed.
+        if ($candidate -match '\s') { return }
+
         $normalizedCandidate = ConvertTo-NormalizedLink -Link $candidate
         if (-not $normalizedCandidate) { return }
 
@@ -4094,8 +4544,8 @@ function Get-NormalizedUrlCandidatesFromText {
 
     # Finally scan the whole line with the script's broad URL extractor so URLs
     # embedded in HTML attributes, Markdown, logs, or CSV text are still found.
-    if ($null -ne $global:RegexRawUrl) {
-        foreach ($match in (Get-RegexMatchesSafe -Regex $global:RegexRawUrl -InputText $lineText -Name "source-list URL extraction")) {
+    if ($null -ne $Script:RegexRawUrl) {
+        foreach ($match in (Get-RegexMatchesSafe -Regex $Script:RegexRawUrl -InputText $lineText -Name "source-list URL extraction")) {
             $rawMatch = $match.Value
 
             # RegexRawUrl is intentionally generous for page scraping. In list
@@ -4177,10 +4627,10 @@ function Get-RedirectTargetViaRawRequest {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
-        try {
-            $request.Proxy = New-Object System.Net.WebProxy ($ProxyUrl, $true)
-        }
-        catch { } # bad proxy URL falls back to default proxy resolution
+        $proxySettings = Get-FindWebLinksProxyParameters -ProxyUrl $ProxyUrl
+        $rawProxy = [System.Net.WebProxy]::new([uri]$proxySettings['Proxy'], $false)
+        if ($proxySettings.ContainsKey('ProxyCredential')) { $rawProxy.Credentials = $proxySettings['ProxyCredential'].GetNetworkCredential() }
+        $request.Proxy = $rawProxy
     }
 
     $rawResponse = $null
@@ -4211,6 +4661,351 @@ function Get-RedirectTargetViaRawRequest {
     }
 }
 
+# Desktop transport retains original response bytes, manual redirects and an
+# abort timer covering the complete request. The Core transport below supplies
+# the equivalent contract using HttpClient and linked cancellation.
+# Neither transport installs certificates or uses PowerShell callbacks on threads.
+function Initialize-DesktopHttpTransport {
+    if ('AEFindWebLinksPS51V191RC1.Transport' -as [type]) { return }
+    $desktopSource = @'
+// Compatibility transport for Windows PowerShell 5.1 / .NET Framework only.
+// No auto-redirects, certificate-store changes, or PowerShell callbacks on threads.
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+namespace AEFindWebLinksPS51V191RC1 {
+    public sealed class Response {
+        public int StatusCode { get; set; }
+        public WebHeaderCollection Headers { get; set; }
+        public string Content { get; set; }
+        public bool FindWebLinksBodyTooLarge { get; set; }
+        public long FindWebLinksBytesRead { get; set; }
+    }
+    public sealed class HttpStatusException : Exception {
+        public Response Response { get; private set; }
+        public HttpStatusException(string message, Response response) : base(message) { Response = response; }
+    }
+    public static class Transport {
+        private sealed class Deadline : IDisposable {
+            private readonly HttpWebRequest request;
+            private readonly Timer timer;
+            private int expired;
+            public bool Expired { get { return Interlocked.CompareExchange(ref expired, 0, 0) != 0; } }
+            public Deadline(HttpWebRequest request, int milliseconds) {
+                this.request = request;
+                timer = new Timer(Expire, null, milliseconds, System.Threading.Timeout.Infinite);
+            }
+            private void Expire(object state) {
+                Interlocked.Exchange(ref expired, 1);
+                try { request.Abort(); } catch { }
+            }
+            public void Dispose() { timer.Dispose(); }
+        }
+        private static bool AcceptUntrusted(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) { return true; }
+        public static void SetCertificateBypass(HttpWebRequest request) {
+            request.ServerCertificateValidationCallback = AcceptUntrusted;
+        }
+        public static Response Send(HttpWebRequest request, int timeoutMs, long maxBytes) {
+            request.Timeout = timeoutMs;
+            request.ReadWriteTimeout = timeoutMs;
+            request.AllowAutoRedirect = false;
+            using (Deadline deadline = new Deadline(request, timeoutMs)) {
+                HttpWebResponse raw = null;
+                try {
+                    try { raw = (HttpWebResponse)request.GetResponse(); }
+                    catch (WebException ex) {
+                        raw = ex.Response as HttpWebResponse;
+                        if (raw == null) throw;
+                    }
+                    Response result = new Response { StatusCode = (int)raw.StatusCode, Headers = new WebHeaderCollection(), Content = "" };
+                    foreach (string key in raw.Headers.AllKeys) result.Headers[key] = raw.Headers[key];
+                    // Preserve original Location/status without replaying GET, and do not
+                    // wait for error/redirect bodies before applying caller policy.
+                    if (result.StatusCode >= 300) return result;
+                    string ct = raw.Headers["Content-Type"] ?? "";
+                    string media = ct.Split(',')[0].Split(';')[0].Trim();
+                    if (media.Length != 0 && !Regex.IsMatch(media, "text|html|json|xml|javascript", RegexOptions.IgnoreCase)) return result;
+                    if (maxBytes > 0 && raw.ContentLength > maxBytes) { result.FindWebLinksBodyTooLarge = true; return result; }
+                    using (Stream stream = raw.GetResponseStream())
+                    using (MemoryStream bytes = new MemoryStream()) {
+                        if (stream != null) {
+                            byte[] buffer = new byte[32768];
+                            int count;
+                            while ((count = stream.Read(buffer, 0, buffer.Length)) > 0) {
+                                if (deadline.Expired) throw new TimeoutException("Desktop HTTP attempt exceeded its total read deadline.");
+                                result.FindWebLinksBytesRead += count;
+                                // Checks decoded/decompressed bytes too, not merely Content-Length.
+                                if (maxBytes > 0 && result.FindWebLinksBytesRead > maxBytes) { result.FindWebLinksBodyTooLarge = true; return result; }
+                                bytes.Write(buffer, 0, count);
+                            }
+                        }
+                        if (deadline.Expired) throw new TimeoutException("Desktop HTTP attempt exceeded its total read deadline.");
+                        Encoding encoding = new UTF8Encoding(false);
+                        Match charset = Regex.Match(ct, @"charset\s*=\s*[""']?([^\s;""',]+)", RegexOptions.IgnoreCase);
+                        if (charset.Success) { try { encoding = Encoding.GetEncoding(charset.Groups[1].Value); } catch (ArgumentException) { } }
+                        bytes.Position = 0;
+                        using (StreamReader reader = new StreamReader(bytes, encoding, true)) result.Content = reader.ReadToEnd();
+                    }
+                    return result;
+                }
+                catch (Exception ex) {
+                    if (deadline.Expired) throw new TimeoutException("Desktop HTTP request exceeded the " + timeoutMs + " ms attempt deadline (headers and body).", ex);
+                    throw;
+                }
+                finally { if (raw != null) raw.Close(); }
+            }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $desktopSource -Language CSharp -ErrorAction Stop
+}
+
+function Invoke-DesktopHttpRequest {
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [AllowNull()][object]$Session,
+        [AllowNull()][hashtable]$Headers,
+        [string]$UserAgent,
+        [AllowNull()][hashtable]$ProxyParameters,
+        [int]$TimeoutSec,
+        [bool]$SkipCertificateValidation = $false,
+        [long]$MaximumBodyBytes = 0
+    )
+    Initialize-DesktopHttpTransport
+    $request = [System.Net.HttpWebRequest]::Create([uri]$Url)
+    $request.Method = 'GET'
+    $request.AllowAutoRedirect = $false
+    $request.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    $request.UserAgent = $UserAgent
+    if ($null -ne $Session -and $null -ne $Session.Cookies) { $request.CookieContainer = $Session.Cookies }
+    if ($null -ne $ProxyParameters -and $ProxyParameters.ContainsKey('Proxy')) {
+        # Never silently replace an explicitly requested proxy with a direct route.
+        $webProxy = [System.Net.WebProxy]::new([uri]$ProxyParameters['Proxy'], $false)
+        if ($ProxyParameters.ContainsKey('ProxyCredential')) { $webProxy.Credentials = $ProxyParameters['ProxyCredential'].GetNetworkCredential() }
+        $request.Proxy = $webProxy
+    }
+    if ($null -ne $Headers) {
+        foreach ($key in @($Headers.Keys)) {
+            $value = [string]$Headers[$key]
+            switch (([string]$key).ToLowerInvariant()) {
+                'accept' { $request.Accept = $value; break }
+                'user-agent' { break } # Dedicated -UserAgent retains precedence.
+                'host' { $request.Host = $value; break }
+                'referer' { $request.Referer = $value; break }
+                'content-type' { $request.ContentType = $value; break }
+                'content-length' { break } # This transport sends bodyless GETs only.
+                'connection' {
+                    if ($value -ieq 'close') { $request.KeepAlive = $false }
+                    elseif ($value -ieq 'keep-alive') { $request.KeepAlive = $true }
+                    else { $request.Connection = $value }
+                    break
+                }
+                'if-modified-since' { $request.IfModifiedSince = [datetime]::Parse($value, [Globalization.CultureInfo]::InvariantCulture); break }
+                'date' { $request.Date = [datetime]::Parse($value, [Globalization.CultureInfo]::InvariantCulture); break }
+                'expect' { $request.Expect = $value; break }
+                'range' {
+                    if ($value -notmatch '^bytes=(\d*)-(\d*)$' -or ($Matches[1] -eq '' -and $Matches[2] -eq '')) { throw 'Desktop transport supports one bytes range per request.' }
+                    if ($Matches[1] -eq '') { $request.AddRange(-[long]$Matches[2]) }
+                    elseif ($Matches[2] -eq '') { $request.AddRange([long]$Matches[1]) }
+                    else { $request.AddRange([long]$Matches[1], [long]$Matches[2]) }
+                    break
+                }
+                default { $request.Headers[[string]$key] = $value }
+            }
+        }
+    }
+    if ($SkipCertificateValidation) { [AEFindWebLinksPS51V191RC1.Transport]::SetCertificateBypass($request) }
+    $timeoutMs = [int][Math]::Min([int]::MaxValue, [Math]::Max(1, [long]$TimeoutSec) * 1000L)
+    try { $result = [AEFindWebLinksPS51V191RC1.Transport]::Send($request, $timeoutMs, $MaximumBodyBytes) }
+    catch {
+        # Preserve the typed inner exception; timeout is not user cancellation.
+        if ($_.Exception -is [System.Management.Automation.MethodInvocationException] -and $null -ne $_.Exception.InnerException) { throw $_.Exception.InnerException }
+        throw
+    }
+    if ($result.StatusCode -ge 400) { throw [AEFindWebLinksPS51V191RC1.HttpStatusException]::new("HTTP $($result.StatusCode) from $Url.", $result) }
+    return $result
+}
+
+# Core transport: the same cancellation deadline covers headers AND every body
+# read. Invoke-WebRequest's OperationTimeoutSeconds is an inactivity timeout,
+# so a server sending a byte periodically could otherwise hold an attempt open.
+function Initialize-CoreHttpTransport {
+    if ('AEFindWebLinksPS7V191RC2.Transport' -as [type]) { return }
+    $coreSource = @'
+using System;
+using System.Collections;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+namespace AEFindWebLinksPS7V191RC2 {
+    public sealed class Response {
+        public int StatusCode { get; set; }
+        public WebHeaderCollection Headers { get; set; }
+        public byte[] Content { get; set; }
+        public bool FindWebLinksBodyTooLarge { get; set; }
+        public long FindWebLinksBytesRead { get; set; }
+    }
+    public sealed class HttpStatusException : Exception {
+        public Response Response { get; private set; }
+        public HttpStatusException(string message, Response response) : base(message) { Response = response; }
+    }
+    public static class Transport {
+        private static bool AcceptUntrusted(HttpRequestMessage request, X509Certificate2 certificate, X509Chain chain, SslPolicyErrors errors) { return true; }
+        public static async Task<Response> SendAsync(
+            string url, CookieContainer cookies, IDictionary headers, string userAgent,
+            IWebProxy proxy, bool explicitProxy, int timeoutMs, long maxBytes,
+            bool skipCertificateValidation, CancellationToken cancellationToken) {
+            using (CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            using (HttpClientHandler handler = new HttpClientHandler()) {
+                deadline.CancelAfter(timeoutMs);
+                handler.AllowAutoRedirect = false;
+                handler.UseCookies = true;
+                handler.CookieContainer = cookies ?? new CookieContainer();
+                DecompressionMethods decompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+                DecompressionMethods brotli;
+                if (Enum.TryParse<DecompressionMethods>("Brotli", out brotli)) decompression |= brotli;
+                handler.AutomaticDecompression = decompression;
+                if (explicitProxy) { handler.UseProxy = true; handler.Proxy = proxy; }
+                // Leave the platform/system proxy untouched when no override was requested.
+                if (skipCertificateValidation) handler.ServerCertificateCustomValidationCallback = AcceptUntrusted;
+                using (HttpClient client = new HttpClient(handler, false))
+                using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, url)) {
+                    client.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
+                    if (!String.IsNullOrEmpty(userAgent)) request.Headers.TryAddWithoutValidation("User-Agent", userAgent);
+                    if (headers != null) {
+                        foreach (DictionaryEntry entry in headers) {
+                            string key = Convert.ToString(entry.Key);
+                            string value = Convert.ToString(entry.Value);
+                            if (String.Equals(key, "User-Agent", StringComparison.OrdinalIgnoreCase)) continue;
+                            if (!request.Headers.TryAddWithoutValidation(key, value)) {
+                                // Preserve explicitly supplied content headers on a bodyless GET.
+                                if (request.Content == null) request.Content = new ByteArrayContent(new byte[0]);
+                                if (!request.Content.Headers.TryAddWithoutValidation(key, value)) throw new ArgumentException("Unsupported HTTP header: " + key);
+                            }
+                        }
+                    }
+                    try {
+                        using (HttpResponseMessage raw = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token).ConfigureAwait(false)) {
+                            Response result = new Response { StatusCode = (int)raw.StatusCode, Headers = new WebHeaderCollection(), Content = new byte[0] };
+                            foreach (var header in raw.Headers) result.Headers[header.Key] = String.Join(", ", header.Value);
+                            if (raw.Content != null) foreach (var header in raw.Content.Headers) result.Headers[header.Key] = String.Join(", ", header.Value);
+                            // Redirect targets are checked by the caller BEFORE another request.
+                            // Error bodies need not be read to apply retry/status policy.
+                            if (result.StatusCode >= 300 || raw.Content == null) return result;
+                            string contentType = result.Headers["Content-Type"] ?? "";
+                            string media = contentType.Split(',')[0].Split(';')[0].Trim();
+                            if (media.Length != 0 && !Regex.IsMatch(media, "text|html|json|xml|javascript", RegexOptions.IgnoreCase)) return result;
+                            long? declared = raw.Content.Headers.ContentLength;
+                            if (maxBytes > 0 && declared.HasValue && declared.Value > maxBytes) { result.FindWebLinksBodyTooLarge = true; return result; }
+                            using (Stream stream = await raw.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                            using (MemoryStream bytes = new MemoryStream()) {
+                                byte[] buffer = new byte[32768];
+                                int count;
+                                while ((count = await stream.ReadAsync(buffer, 0, buffer.Length, deadline.Token).ConfigureAwait(false)) > 0) {
+                                    deadline.Token.ThrowIfCancellationRequested();
+                                    result.FindWebLinksBytesRead += count;
+                                    if (maxBytes > 0 && result.FindWebLinksBytesRead > maxBytes) { result.FindWebLinksBodyTooLarge = true; return result; }
+                                    bytes.Write(buffer, 0, count);
+                                }
+                                deadline.Token.ThrowIfCancellationRequested();
+                                // Keep the actual bytes. The shared decoder honors BOM and charset;
+                                // a prematurely decoded Invoke-WebRequest string cannot be repaired.
+                                result.Content = bytes.ToArray();
+                            }
+                            return result;
+                        }
+                    }
+                    catch (Exception ex) {
+                        if (deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                            throw new TimeoutException("Core HTTP request exceeded the " + timeoutMs + " ms attempt deadline (headers and body).", ex);
+                        throw;
+                    }
+                }
+            }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $coreSource -Language CSharp -ErrorAction Stop
+}
+
+function Invoke-CoreHttpRequest {
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [AllowNull()][object]$Session,
+        [AllowNull()][hashtable]$Headers,
+        [string]$UserAgent,
+        [AllowNull()][hashtable]$ProxyParameters,
+        [int]$TimeoutSec,
+        [bool]$SkipCertificateValidation = $false,
+        [long]$MaximumBodyBytes = 0
+    )
+    Initialize-CoreHttpTransport
+    $cookies = $null
+    if ($null -ne $Session -and $null -ne $Session.Cookies) { $cookies = $Session.Cookies }
+    $explicitProxy = $null -ne $ProxyParameters -and $ProxyParameters.ContainsKey('Proxy')
+    $webProxy = $null
+    if ($explicitProxy) {
+        $webProxy = [System.Net.WebProxy]::new([uri]$ProxyParameters['Proxy'], $false)
+        if ($ProxyParameters.ContainsKey('ProxyCredential')) { $webProxy.Credentials = $ProxyParameters['ProxyCredential'].GetNetworkCredential() }
+    }
+    $timeoutMs = [int][Math]::Min([int]::MaxValue, [Math]::Max(1, [long]$TimeoutSec) * 1000L)
+    $cancel = [System.Threading.CancellationTokenSource]::new()
+    $task = $null
+    try {
+        $task = [AEFindWebLinksPS7V191RC2.Transport]::SendAsync($Url, $cookies, $Headers, $UserAgent, $webProxy, $explicitProxy, $timeoutMs, $MaximumBodyBytes, $SkipCertificateValidation, $cancel.Token)
+        # Poll in PowerShell rather than blocking the pipeline in a synchronous
+        # .NET read: pipeline stop/Ctrl+C can unwind through the cancellation finally.
+        while (-not $task.IsCompleted) { Start-Sleep -Milliseconds 50 }
+        $result = $task.GetAwaiter().GetResult()
+        if ($result.StatusCode -ge 400) { throw [AEFindWebLinksPS7V191RC2.HttpStatusException]::new("HTTP $($result.StatusCode) from $Url.", $result) }
+        return $result
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.MethodInvocationException] -and $null -ne $_.Exception.InnerException) { throw $_.Exception.InnerException }
+        throw
+    }
+    finally {
+        if ($null -ne $task -and -not $task.IsCompleted) {
+            $cancel.Cancel()
+            try { [void]$task.Wait(2000) } catch { }
+        }
+        $cancel.Dispose()
+    }
+}
+
+# Compatibility parameter-map helper, retained for existing callers and tests.
+# Live Core requests use Invoke-CoreHttpRequest; this map is not their deadline.
+function Get-WebRequestAttemptParameters {
+    param(
+        [AllowNull()][hashtable]$ProxyParameters,
+        [int]$AttemptTimeoutSeconds
+    )
+
+    $attemptParams = @{}
+    if ($null -ne $ProxyParameters) {
+        foreach ($key in @($ProxyParameters.Keys)) { $attemptParams[$key] = $ProxyParameters[$key] }
+    }
+    if ($null -ne $Script:WebRequestExtraParams) {
+        foreach ($key in @($Script:WebRequestExtraParams.Keys)) { $attemptParams[$key] = $Script:WebRequestExtraParams[$key] }
+    }
+    if ($Script:IwrSupportsOperationTimeout -and $AttemptTimeoutSeconds -gt 0) {
+        $attemptParams['OperationTimeoutSeconds'] = $AttemptTimeoutSeconds
+    }
+    return $attemptParams
+}
+
 function Get-FindWebLinksProxyParameters {
     param(
         [AllowNull()]
@@ -4235,15 +5030,19 @@ function Get-FindWebLinksProxyParameters {
             throw "Proxy scheme must be http or https. Got: $($proxyUri.Scheme)"
         }
 
+        if ([string]::IsNullOrWhiteSpace($proxyUri.Host)) { throw 'Proxy host is required.' }
         $proxyForRequest = $proxyUri.AbsoluteUri
 
         if (-not [string]::IsNullOrWhiteSpace($proxyUri.UserInfo)) {
             $creds = $proxyUri.UserInfo -split ':', 2
-            $user = [System.Net.WebUtility]::UrlDecode($creds[0])
-            $pass = if ($creds.Count -eq 2) { [System.Net.WebUtility]::UrlDecode($creds[1]) } else { "" }
+            $user = [uri]::UnescapeDataString($creds[0])
+            $pass = if ($creds.Count -eq 2) { [uri]::UnescapeDataString($creds[1]) } else { "" }
 
+            if ([string]::IsNullOrWhiteSpace($user)) { throw 'Proxy username cannot be empty when userinfo is supplied.' }
             if (-not [string]::IsNullOrWhiteSpace($user)) {
-                $securePass = ConvertTo-SecureString -String $pass -AsPlainText -Force
+                $securePass = [System.Security.SecureString]::new()
+                foreach ($character in $pass.ToCharArray()) { $securePass.AppendChar($character) }
+                $securePass.MakeReadOnly()
                 $params['ProxyCredential'] = [System.Management.Automation.PSCredential]::new($user, $securePass)
 
                 # Strip credentials from the proxy URI supplied to the cmdlet.
@@ -4258,7 +5057,8 @@ function Get-FindWebLinksProxyParameters {
         return $params
     }
     catch {
-        throw "Invalid -Proxy value '$ProxyUrl'. Use a full proxy URL such as http://proxy:8080 or http://user:pass@proxy:8080. $($_.Exception.Message)"
+        # Do not echo credential-bearing input or URI-parser exception text.
+        throw "Invalid -Proxy value. Use an absolute http:// or https:// proxy URL with a host and optional user:password authentication."
     }
 }
 
@@ -4467,6 +5267,21 @@ function Get-ResponseContentText {
     try {
         $contentProp = $Response.PSObject.Properties['Content']
         if ($null -ne $contentProp) {
+            if ($contentProp.Value -is [byte[]]) {
+                $encoding = [System.Text.UTF8Encoding]::new($false)
+                $ct = Get-ResponseHeaderValue -Response $Response -Name 'Content-Type'
+                if ($ct -match 'charset\s*=\s*["'']?([^\s;"'',]+)') {
+                    try { $encoding = [System.Text.Encoding]::GetEncoding($Matches[1]) } catch [System.ArgumentException] { }
+                }
+                $stream = [IO.MemoryStream]::new([byte[]]$contentProp.Value, $false)
+                $reader = $null
+                try {
+                    $reader = [IO.StreamReader]::new($stream, $encoding, $true)
+                    return $reader.ReadToEnd()
+                } finally {
+                    if ($null -ne $reader) { $reader.Dispose() } else { $stream.Dispose() }
+                }
+            }
             return [string]$contentProp.Value
         }
     }
@@ -4790,7 +5605,7 @@ function Get-RobotsHttpStatusFromErrorMessage {
     if ([string]::IsNullOrWhiteSpace($Message)) { return $null }
     if ($Message -match '(?i)(HTTP|status code[^0-9]*:?\s*)\s*(?<code>\d{3})') {
         $code = 0
-        if ([int]::TryParse($matches['code'].Value, [ref]$code)) { return $code }
+        if ([int]::TryParse($matches['code'], [ref]$code)) { return $code }
     }
 
     return $null
@@ -4831,7 +5646,7 @@ function Get-RobotsPolicyForUrl {
     $response = $null
 
     try {
-        Write-Host "  robots.txt: checking $robotsUrl"
+        Write-Detail "  robots.txt: checking $robotsUrl"
 
         $response = Invoke-WebRequestWithRetry `
             -Url $robotsUrl `
@@ -4849,6 +5664,9 @@ function Get-RobotsPolicyForUrl {
             -StuckUrlStopwatch $StuckUrlStopwatch `
             -StuckUrlTimeoutSecondsValue $StuckUrlTimeoutSecondsValue
 
+        if ($response.PSObject.Properties['FindWebLinksBodyTooLarge'] -and $response.FindWebLinksBodyTooLarge) {
+            throw 'robots.txt response exceeds the configured response-body limit; policy is unavailable.'
+        }
         $robotsText = Get-ResponseContentText -Response $response -Context "robots.txt"
         if ($Script:MaxRobotsTxtBytes -gt 0) {
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($robotsText)
@@ -4868,7 +5686,7 @@ function Get-RobotsPolicyForUrl {
             -Rules $rules `
             -Message "Loaded $($rules.Count) applicable robots.txt rule(s) for User-agent '$RobotsUserAgentValue'."
 
-        Write-Host "  robots.txt: loaded policy for $originKey ($($rules.Count) applicable rule(s))."
+        Write-Detail "  robots.txt: loaded policy for $originKey ($($rules.Count) applicable rule(s))."
     }
     catch {
         if (Test-IsCancellationException $_) { throw }
@@ -5042,7 +5860,7 @@ function Invoke-WebRequestWithRetry {
         [int]$StuckUrlTimeoutSecondsValue = 0
     )
 
-    if ($Url -notmatch '^https?://') { $Url = "https://$Url" }
+    if ($Url -notmatch '^https?://') { $Url = "$($Script:BareHostScheme)://$Url" }
 
     $currentUrl = ConvertTo-NormalizedLink -Link $Url
     if (-not $currentUrl) {
@@ -5056,6 +5874,12 @@ function Invoke-WebRequestWithRetry {
         "Accept"           = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         "Accept-Language"  = "en-GB,en;q=0.9"
         "Cache-Control"    = "no-cache"
+    }
+
+    if ($Script:ExtraHeaders -and $Script:ExtraHeaders.Count -gt 0) {
+        foreach ($extraHeaderName in @($Script:ExtraHeaders.Keys)) {
+            $headers[$extraHeaderName] = $Script:ExtraHeaders[$extraHeaderName]
+        }
     }
 
     $webRequestProxyParams = Get-FindWebLinksProxyParameters -ProxyUrl $ProxyUrl
@@ -5091,7 +5915,7 @@ function Invoke-WebRequestWithRetry {
 
         for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
             try {
-                Write-Host "  Attempt $attempt of $MaxRetries -- GET $currentUrl"
+                Write-Detail "  Attempt $attempt of $MaxRetries -- GET $currentUrl"
                 $attemptTimeout = Get-StuckUrlBoundedTimeoutSeconds `
                     -ConfiguredTimeoutSeconds $Timeout `
                     -Url $currentUrl `
@@ -5101,16 +5925,11 @@ function Invoke-WebRequestWithRetry {
 
                 # Disable automatic redirect following so every Location target can be
                 # validated before another network request is made.
-                $response = Invoke-WebRequest `
-                    -Uri $currentUrl `
-                    -WebSession $session `
-                    -Headers $headers `
-                    -UserAgent $UserAgentString `
-                    -UseBasicParsing `
-                    -MaximumRedirection 0 `
-                    -TimeoutSec $attemptTimeout `
-                    -ErrorAction Stop `
-                    @webRequestProxyParams
+                if ($Script:PSMajorVersion -le 5) {
+                    $response = Invoke-DesktopHttpRequest -Url $currentUrl -Session $session -Headers $headers -UserAgent $UserAgentString -ProxyParameters $webRequestProxyParams -TimeoutSec $attemptTimeout -SkipCertificateValidation $Script:DesktopSkipCertificateValidation -MaximumBodyBytes $Script:MaxPageContentBytes
+                } else {
+                    $response = Invoke-CoreHttpRequest -Url $currentUrl -Session $session -Headers $headers -UserAgent $UserAgentString -ProxyParameters $webRequestProxyParams -TimeoutSec $attemptTimeout -SkipCertificateValidation $Script:DesktopSkipCertificateValidation -MaximumBodyBytes $Script:MaxPageContentBytes
+                }
 
                 Assert-StuckUrlWatchdog -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "completing HTTP request"
 
@@ -5142,7 +5961,7 @@ function Invoke-WebRequestWithRetry {
                         throw "SSRF Blocked: Redirect targets private/internal network ($redirectUrl)."
                     }
 
-                    Write-Host "  Following HTTP redirect -> $redirectUrl"
+                    Write-Detail "  Following HTTP redirect -> $redirectUrl"
                     Close-BaseResponseSafe $response
                     $response = $null
                     $currentUrl = $redirectUrl
@@ -5167,16 +5986,11 @@ function Invoke-WebRequestWithRetry {
                             -TimeoutSeconds $StuckUrlTimeoutSecondsValue `
                             -Phase "starting second fetch"
 
-                        $response2 = Invoke-WebRequest `
-                            -Uri $currentUrl `
-                            -WebSession $session `
-                            -Headers $headers `
-                            -UserAgent $UserAgentString `
-                            -UseBasicParsing `
-                            -MaximumRedirection 0 `
-                            -TimeoutSec $secondAttemptTimeout `
-                            -ErrorAction Stop `
-                            @webRequestProxyParams
+                        if ($Script:PSMajorVersion -le 5) {
+                            $response2 = Invoke-DesktopHttpRequest -Url $currentUrl -Session $session -Headers $headers -UserAgent $UserAgentString -ProxyParameters $webRequestProxyParams -TimeoutSec $secondAttemptTimeout -SkipCertificateValidation $Script:DesktopSkipCertificateValidation -MaximumBodyBytes $Script:MaxPageContentBytes
+                        } else {
+                            $response2 = Invoke-CoreHttpRequest -Url $currentUrl -Session $session -Headers $headers -UserAgent $UserAgentString -ProxyParameters $webRequestProxyParams -TimeoutSec $secondAttemptTimeout -SkipCertificateValidation $Script:DesktopSkipCertificateValidation -MaximumBodyBytes $Script:MaxPageContentBytes
+                        }
 
                         Assert-StuckUrlWatchdog -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "completing second fetch"
 
@@ -5221,7 +6035,7 @@ function Invoke-WebRequestWithRetry {
 
                 # Check for <meta http-equiv="refresh"> redirect (quoted or unquoted).
                 $responseTextForMetaRefresh = Get-ResponseContentText -Response $response -Context "meta-refresh scan"
-                $metaRefresh = Get-RegexFirstMatchSafe -Regex $global:RegexMetaRefresh -InputText $responseTextForMetaRefresh -Name "meta-refresh redirect"
+                $metaRefresh = Get-RegexFirstMatchSafe -Regex $Script:RegexMetaRefresh -InputText $responseTextForMetaRefresh -Name "meta-refresh redirect"
                 if ($null -ne $metaRefresh -and $metaRefresh.Success) {
                     $nextUrl = $metaRefresh.Groups["url"].Value.Trim()
                     $nextUrl = ConvertTo-NormalizedLink -Link $nextUrl -BaseUri ([uri]$currentUrl)
@@ -5238,7 +6052,7 @@ function Invoke-WebRequestWithRetry {
                             throw "SSRF Blocked: Meta-refresh redirect targets private/internal network ($nextUrl)."
                         }
 
-                        Write-Host "  Following meta-refresh redirect -> $nextUrl"
+                        Write-Detail "  Following meta-refresh redirect -> $nextUrl"
                         Close-BaseResponseSafe $response
                         $response = $null
                         $currentUrl = $nextUrl
@@ -5282,6 +6096,8 @@ function Invoke-WebRequestWithRetry {
                     $response = $null
                 }
 
+                # Retained legacy fallback for cmdlet-based transports. Desktop 5.1
+                # now uses Invoke-DesktopHttpRequest and does not enter this branch.
                 # PowerShell 5.1's Invoke-WebRequest throws InvalidOperationException
                 # with FQEID "MaximumRedirectExceeded" when a 3xx response is returned
                 # under -MaximumRedirection 0, and crucially does NOT attach the
@@ -5329,7 +6145,7 @@ function Invoke-WebRequestWithRetry {
                             throw "SSRF Blocked: Redirect targets private/internal network ($redirectUrl)."
                         }
 
-                        Write-Host "  Following HTTP redirect -> $redirectUrl"
+                        Write-Detail "  Following HTTP redirect -> $redirectUrl"
                         $currentUrl = $redirectUrl
                         $redirectsDone++
                         continue redirectLoop
@@ -5350,8 +6166,9 @@ function Invoke-WebRequestWithRetry {
                     $statusCode = Get-ResponseStatusCode -Response $responseObj
 
                     if ($null -ne $statusCode) {
-                        # Fail permanently on hard blocks
-                        if ($statusCode -in @(401, 403, 404, 410)) {
+                        # Do not replay unchanged bad requests / unsupported methods.
+                        # 408/429 and transient 5xx responses keep their retry policy.
+                        if ($statusCode -in @(400, 401, 403, 404, 405, 410)) {
                             Close-BaseResponseSafe $responseObj
                             throw "Permanent HTTP $statusCode error. Aborting retries for $currentUrl."
                         }
@@ -5375,7 +6192,7 @@ function Invoke-WebRequestWithRetry {
                                     throw "SSRF Blocked: Redirect targets private/internal network ($redirectUrl)."
                                 }
 
-                                Write-Host "  Following HTTP redirect -> $redirectUrl"
+                                Write-Detail "  Following HTTP redirect -> $redirectUrl"
                                 Close-BaseResponseSafe $responseObj
                                 $currentUrl = $redirectUrl
                                 $redirectsDone++
@@ -5422,11 +6239,11 @@ function Invoke-WebRequestWithRetry {
                 if ($attempt -lt $MaxRetries) {
                     $effectiveWait = [Math]::Max(0, $WaitSec)
                     if ($effectiveWait -gt 0) {
-                        Write-Host "  Retrying in $effectiveWait second(s) ..."
+                        Write-Detail "  Retrying in $effectiveWait second(s) ..."
                         Start-SleepWithStuckUrlWatchdog -Seconds $effectiveWait -Url $currentUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "waiting before retry"
                     }
                     else {
-                        Write-Host "  Retrying immediately ..."
+                        Write-Detail "  Retrying immediately ..."
                     }
                 }
             }
@@ -5467,7 +6284,7 @@ function Get-LinksFromWebPage {
         [int]$StuckUrlTimeoutSecondsValue = 0
     )
 
-    if ($PageUrl -notmatch '^https?://') { $PageUrl = "https://$PageUrl" }
+    if ($PageUrl -notmatch '^https?://') { $PageUrl = "$($Script:BareHostScheme)://$PageUrl" }
     Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "starting page fetch"
 
     $response = $null
@@ -5498,8 +6315,13 @@ function Get-LinksFromWebPage {
             return @()
         }
 
-        # Content-Length is only a hint because Invoke-WebRequest has already loaded
-        # the body, but it still avoids expensive parsing/regex work on huge responses.
+        if ($response.PSObject.Properties['FindWebLinksBodyTooLarge'] -and $response.FindWebLinksBodyTooLarge) {
+            Write-Host "  Skipping: response exceeds $($MaxPageContentMBValue) MB while reading. Use -MaxPageContentMB 0 to disable this guard."
+            return @()
+        }
+
+        # Content-Length is only a hint. The native transports also bound streamed
+        # decompressed bytes; this independent guard protects later parsing.
         $clRaw = Get-ResponseHeaderValue -Response $response -Name "Content-Length"
         if ($null -ne $clRaw) {
             $clValue = 0L
@@ -5533,7 +6355,7 @@ function Get-LinksFromWebPage {
             return @()
         }
 
-        Write-Host "  Page content length: $($html.Length) characters"
+        Write-Detail "  Page content length: $($html.Length) characters"
 
         # Resolve base URI from the final response URL after redirects.
         $finalUrl = Get-ResponseFinalUrl -Response $response -FallbackUrl $PageUrl
@@ -5546,17 +6368,14 @@ function Get-LinksFromWebPage {
         }
 
         # Honour <base href="..."> if the page declares one (quoted or unquoted).
-        $baseTag = Get-RegexFirstMatchSafe -Regex $global:RegexBaseHref -InputText $html -Name "base href"
+        $baseTag = Get-RegexFirstMatchSafe -Regex $Script:RegexBaseHref -InputText $html -Name "base href"
         if ($null -ne $baseTag -and $baseTag.Success) {
             $baseHref = ConvertTo-NormalizedLink -Link $baseTag.Groups["href"].Value -BaseUri $baseUri
             if ($baseHref) {
                 $baseUri = [uri]$baseHref
-                Write-Host "  Using <base href>: $baseHref"
+                Write-Detail "  Using <base href>: $baseHref"
             }
         }
-
-        # Use List[string] so -KeepDuplicates is not silently broken.
-        $found = New-Object System.Collections.Generic.List[string]
 
         # #11: Strip HTML comments to avoid extracting dead/commented-out links.
         # Use StringBuilder for a single O(n) pass instead of repeated String.Remove
@@ -5592,83 +6411,68 @@ function Get-LinksFromWebPage {
 
         Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "preparing link extraction"
 
-        # #12: Extract OpenGraph, Twitter Card, and other meta content URLs
-        foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexMetaContentUrl -InputText $htmlClean -Name "meta content URLs")) {
-            $found.Add($m.Groups["url"].Value)
-        }
+        $occurrences = [System.Collections.Generic.List[object]]::new()
 
-        # #17: Extract @import url() from <style> blocks
-        foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexStyleImport -InputText $htmlClean -Name "style imports")) {
-            $val = $m.Groups["url"].Value
-            if (-not $val.StartsWith("data:", [System.StringComparison]::OrdinalIgnoreCase)) {
-                $found.Add($val)
+        foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexMetaContentUrl -InputText $htmlClean -Name 'meta content URLs')) {
+            $g = $m.Groups['url']
+            Add-FoundLinkOccurrence $occurrences $g.Value $g.Index $g.Length
+        }
+        foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexStyleImport -InputText $htmlClean -Name 'style imports')) {
+            $g = $m.Groups['url']
+            if (-not $g.Value.StartsWith('data:', [StringComparison]::OrdinalIgnoreCase)) {
+                Add-FoundLinkOccurrence $occurrences $g.Value $g.Index $g.Length
             }
         }
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase 'extracting style/meta URLs'
 
-        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "extracting style/meta URLs"
-
-        # ----- 1. Quoted HTML attributes: href, src, action, data-*, etc. -----
-        foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexAttr -InputText $htmlClean -Name "quoted HTML attributes")) {
-            $attrName = $m.Groups["attr"].Value
-            Add-FoundLinkCandidate -List $found -Value $m.Groups["url"].Value -Srcset:($attrName -ieq "srcset")
-        }
-
-        # Unquoted HTML attributes (e.g. href=https://example.com)
-        foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexUnquotedAttr -InputText $htmlClean -Name "unquoted HTML attributes")) {
-            $attrName = $m.Groups["attr"].Value
-            Add-FoundLinkCandidate -List $found -Value $m.Groups["url"].Value -Srcset:($attrName -ieq "srcset")
-        }
-
-        # ----- 2. Raw absolute / protocol-relative / bare URLs anywhere -------
-        foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexRawUrl -InputText $htmlClean -Name "raw URLs")) {
-            $found.Add($m.Value)
-        }
-
-        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "extracting raw and attribute URLs"
-
-        # ----- 3. URLs inside <script> blocks (JSON, JS assignments, etc.) ----
-        foreach ($scriptMatch in (Get-RegexMatchesSafe -Regex $global:RegexScript -InputText $htmlClean -Name "script blocks")) {
-            $body = $scriptMatch.Groups["body"].Value
-
-            # Quoted strings that look like URLs
-            foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexJsUrl -InputText $body -Name "JavaScript URLs")) {
-                $raw = ConvertFrom-JsUrl $m.Groups["url"].Value
-                # Strip ES6 template literal interpolation markers
-                $raw = $raw -replace '\$\{[^}]*\}', ''
-                if ($raw -and $raw.Length -gt 4) { $found.Add($raw) }
-            }
-
-            # JSON-style "key": "/path/..." or "key": "https://..."
-            foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexJsonPath -InputText $body -Name "JSON paths")) {
-                $found.Add((ConvertFrom-JsUrl $m.Groups["url"].Value))
+        foreach ($attributeRegex in @($Script:RegexAttr, $Script:RegexUnquotedAttr)) {
+            foreach ($m in (Get-RegexMatchesSafe -Regex $attributeRegex -InputText $htmlClean -Name 'HTML attributes')) {
+                $g = $m.Groups['url']
+                Add-FoundLinkOccurrence $occurrences $g.Value $g.Index $g.Length -Srcset:($m.Groups['attr'].Value -ieq 'srcset')
             }
         }
+        # These global attribute scans already include <noscript>. Scanning the
+        # same fallback body again used to invent a second copy of its links.
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase 'extracting attribute URLs'
 
-        # ----- 4. <noscript> blocks (fallback content for no-JS) --------------
-        foreach ($nsMatch in (Get-RegexMatchesSafe -Regex $global:RegexNoscript -InputText $htmlClean -Name "noscript blocks")) {
-            $nsBody = $nsMatch.Groups["body"].Value
-            foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexAttr -InputText $nsBody -Name "noscript quoted attributes")) {
-                $attrName = $m.Groups["attr"].Value
-                Add-FoundLinkCandidate -List $found -Value $m.Groups["url"].Value -Srcset:($attrName -ieq "srcset")
+        foreach ($scriptMatch in (Get-RegexMatchesSafe -Regex $Script:RegexScript -InputText $htmlClean -Name 'script blocks')) {
+            $bodyGroup = $scriptMatch.Groups['body']
+            foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexJsUrl -InputText $bodyGroup.Value -Name 'JavaScript URLs')) {
+                $g = $m.Groups['url']
+                $raw = (ConvertFrom-JsUrl $g.Value) -replace '\$\{[^}]*\}', ''
+                if ($raw -and $raw.Length -gt 4) { Add-FoundLinkOccurrence $occurrences $raw ($bodyGroup.Index + $g.Index) $g.Length }
             }
-            foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexUnquotedAttr -InputText $nsBody -Name "noscript unquoted attributes")) {
-                $attrName = $m.Groups["attr"].Value
-                Add-FoundLinkCandidate -List $found -Value $m.Groups["url"].Value -Srcset:($attrName -ieq "srcset")
-            }
-        }
-
-        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "extracting script and noscript URLs"
-
-        # ----- 5. CSS url() references ----------------------------------------
-        foreach ($m in (Get-RegexMatchesSafe -Regex $global:RegexCssUrl -InputText $htmlClean -Name "CSS url() references")) {
-            $val = $m.Groups["url"].Value
-            # Skip data: URIs early to avoid wasting cycles on base64 blobs
-            if (-not $val.StartsWith("data:", [System.StringComparison]::OrdinalIgnoreCase)) {
-                $found.Add($val)
+            foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexJsonPath -InputText $bodyGroup.Value -Name 'JSON paths')) {
+                $g = $m.Groups['url']
+                Add-FoundLinkOccurrence $occurrences (ConvertFrom-JsUrl $g.Value) ($bodyGroup.Index + $g.Index) $g.Length
             }
         }
+        if (-not [string]::IsNullOrWhiteSpace($contentType) -and $contentType -match '(?i)json|javascript|ecmascript') {
+            foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexJsUrl -InputText $htmlClean -Name 'JSON/JS body URLs')) {
+                $g = $m.Groups['url']
+                $raw = (ConvertFrom-JsUrl $g.Value) -replace '\$\{[^}]*\}', ''
+                if ($raw -and $raw.Length -gt 4) { Add-FoundLinkOccurrence $occurrences $raw $g.Index $g.Length }
+            }
+            foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexJsonPath -InputText $htmlClean -Name 'JSON/JS body paths')) {
+                $g = $m.Groups['url']
+                Add-FoundLinkOccurrence $occurrences (ConvertFrom-JsUrl $g.Value) $g.Index $g.Length
+            }
+        }
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase 'extracting script and noscript URLs'
 
-        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase "normalising extracted URLs"
+        foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexCssUrl -InputText $htmlClean -Name 'CSS url() references')) {
+            $g = $m.Groups['url']
+            if (-not $g.Value.StartsWith('data:', [StringComparison]::OrdinalIgnoreCase)) {
+                Add-FoundLinkOccurrence $occurrences $g.Value $g.Index $g.Length
+            }
+        }
+        # Raw text remains supported, but overlapping matches from any earlier
+        # scanner are reconciled by source span rather than by URL equality.
+        foreach ($m in (Get-RegexMatchesSafe -Regex $Script:RegexRawUrl -InputText $htmlClean -Name 'raw URLs')) {
+            Add-FoundLinkOccurrence $occurrences $m.Value $m.Index $m.Length
+        }
+        Assert-StuckUrlWatchdog -Url $PageUrl -Stopwatch $StuckUrlStopwatch -TimeoutSeconds $StuckUrlTimeoutSecondsValue -Phase 'normalising extracted URLs'
+        $found = @(Get-UniqueLinkOccurrenceValues $occurrences)
 
         # Normalize everything and remove failed normalisations
         return @(
@@ -5699,7 +6503,7 @@ function Invoke-GetLinksFromWebPageWithWatchdog {
         [int]$MaxPageContentMBValue
     )
 
-    $watchdogLimit = if ($null -ne $Script:StuckUrlTimeoutSeconds) { [int]$Script:StuckUrlTimeoutSeconds } else { 0 }
+    $watchdogLimit = if ($null -ne $Script:StuckUrlWatchdogSeconds) { [int]$Script:StuckUrlWatchdogSeconds } else { 0 }
     $maxWatchdogRuns = if ($watchdogLimit -gt 0) { [Math]::Max(1, $MaxRetries) } else { 1 }
 
     for ($watchdogRun = 1; $watchdogRun -le $maxWatchdogRuns; $watchdogRun++) {
@@ -5753,90 +6557,93 @@ function Invoke-GetLinksFromWebPageWithWatchdog {
 # REGEX DEFINITIONS
 # Pre-compiled regexes for link extraction (compiled once, used per page)
 # ---------------------------------------------------------------------------
-$global:CompiledRegexOptions = [System.Text.RegularExpressions.RegexOptions]::Compiled -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::ExplicitCapture
-$global:RegexTimeout = $Script:RegexTimeout
+$Script:CompiledRegexOptions = [System.Text.RegularExpressions.RegexOptions]::Compiled -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::ExplicitCapture
 
 # Matches standard attributes like href="", src="", data-url=""
-$global:RegexAttr = [regex]::new(
+$Script:RegexAttr = [regex]::new(
     '\b(?<attr>href|src|action|data-href|data-url|data-src|data-link|data-redirect|formaction|poster|srcset)\s*=\s*["''](?<url>[^"'']+)["'']',
-    $global:CompiledRegexOptions, $global:RegexTimeout
+    $Script:CompiledRegexOptions, $Script:RegexTimeout
 )
 
 # Matches unquoted attributes like href=https://example.com
-$global:RegexUnquotedAttr = [regex]::new(
+$Script:RegexUnquotedAttr = [regex]::new(
     '\b(?<attr>href|src|action|data-href|data-url|data-src|data-link|data-redirect|formaction|poster|srcset)\s*=\s*(?<url>[^\s"''>]+)',
-    $global:CompiledRegexOptions, $global:RegexTimeout
+    $Script:CompiledRegexOptions, $Script:RegexTimeout
 )
 
 # Matches raw absolute URLs explicitly written in the HTML body
-$global:RegexRawUrl = [regex]::new(
+$Script:RegexRawUrl = [regex]::new(
     # The body of each domain alternative uses [a-z0-9.-]* (zero or more)
     # rather than + so that single-letter first labels like t.co, g.co, and
     # j.mp are extracted from raw text. The negative lookbehind on the last
-    # alternative still prevents matches inside paths and word-like contexts.
+    # alternative still prevents matches inside paths and word-like contexts;
+    # % is in that class so a percent-encoded path such as space%20name.zip
+    # cannot yield a bogus bare domain "20name.zip". The protocol-relative
+    # alternative refuses a preceding ':' so ftp://x/y is not read as //x/y
+    # and rewritten as an http URL.
     '(?x)
     (?:
         https?://[^\s<>"''\)\]\}]+
-      | //[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d+)?(?:[/?#][^\s<>"''\)\]\}]*)?
+      | (?<!:)//[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d+)?(?:[/?#][^\s<>"''\)\]\}]*)?
       | www\.[^\s<>"''\)\]\}]+
-      | (?<![@/\w.-])[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d+)?(?:[/?#][^\s<>"''\)\]\}]*)?
+      | (?<![@/\w.%-])[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d+)?(?:[/?#][^\s<>"''\)\]\}]*)?
     )',
-    $global:CompiledRegexOptions, $global:RegexTimeout
+    $Script:CompiledRegexOptions, $Script:RegexTimeout
 )
 
-$global:RegexScript = [regex]::new(
+$Script:RegexScript = [regex]::new(
     '<script[^>]*>(?<body>.*?)</script>',
     [System.Text.RegularExpressions.RegexOptions]::Compiled -bor
     [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
     [System.Text.RegularExpressions.RegexOptions]::Singleline,
-    $global:RegexTimeout
+    $Script:RegexTimeout
 )
 
-$global:RegexJsUrl = [regex]::new(
+$Script:RegexJsUrl = [regex]::new(
     '(?:"|''|`)(?<url>(?:https?:)?(?:\\?/){2}[^"''`\s]{5,})(?:"|''|`)',
-    $global:CompiledRegexOptions, $global:RegexTimeout
+    $Script:CompiledRegexOptions, $Script:RegexTimeout
 )
 
-$global:RegexJsonPath = [regex]::new(
+$Script:RegexJsonPath = [regex]::new(
     '"[^"]*"\s*:\s*"(?<url>\\?/[^"]{2,}|https?:\\?/\\?/[^"]+)"',
-    $global:CompiledRegexOptions, $global:RegexTimeout
+    $Script:CompiledRegexOptions, $Script:RegexTimeout
 )
 
-$global:RegexNoscript = [regex]::new(
+$Script:RegexNoscript = [regex]::new(
     '<noscript[^>]*>(?<body>.*?)</noscript>',
     [System.Text.RegularExpressions.RegexOptions]::Compiled -bor
     [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
     [System.Text.RegularExpressions.RegexOptions]::Singleline,
-    $global:RegexTimeout
+    $Script:RegexTimeout
 )
 
-$global:RegexCssUrl = [regex]::new(
+$Script:RegexCssUrl = [regex]::new(
     'url\(\s*["'']?(?<url>[^"''\)\s]+)["'']?\s*\)',
-    $global:CompiledRegexOptions, $global:RegexTimeout
+    $Script:CompiledRegexOptions, $Script:RegexTimeout
 )
 
-$global:RegexMetaRefresh = [regex]::new(
+$Script:RegexMetaRefresh = [regex]::new(
     '<meta\b(?=[^>]*http-equiv\s*=\s*["'']?refresh["'']?)(?=[^>]*content\s*=\s*["'']?\s*\d+\s*;\s*url\s*=\s*["'']*(?<url>[^"''\s>]+))[^>]*>',
-    $global:CompiledRegexOptions -bor [System.Text.RegularExpressions.RegexOptions]::Singleline,
-    $global:RegexTimeout
+    $Script:CompiledRegexOptions -bor [System.Text.RegularExpressions.RegexOptions]::Singleline,
+    $Script:RegexTimeout
 )
 
-$global:RegexBaseHref = [regex]::new(
+$Script:RegexBaseHref = [regex]::new(
     '<base[^>]+href\s*=\s*(?:["''](?<href>[^"'']+)["'']|(?<href>[^\s"''>]+))',
-    $global:CompiledRegexOptions,
-    $global:RegexTimeout
+    $Script:CompiledRegexOptions,
+    $Script:RegexTimeout
 )
 
-$global:RegexMetaContentUrl = [regex]::new(
+$Script:RegexMetaContentUrl = [regex]::new(
     '<meta[^>]+content\s*=\s*["''](?<url>https?://[^"'']+)["'']',
-    $global:CompiledRegexOptions,
-    $global:RegexTimeout
+    $Script:CompiledRegexOptions,
+    $Script:RegexTimeout
 )
 
-$global:RegexStyleImport = [regex]::new(
+$Script:RegexStyleImport = [regex]::new(
     '@import\s+(?:url\()?\s*["'']?(?<url>[^"''\)\s;]+)["'']?\s*\)?',
-    $global:CompiledRegexOptions,
-    $global:RegexTimeout
+    $Script:CompiledRegexOptions,
+    $Script:RegexTimeout
 )
 
 # ---------------------------------------------------------------------------
@@ -6067,10 +6874,6 @@ try {
         throw "-Resume without crawl mode is only useful with SourceType File. Crawl-mode resume supports SourceType Url and File because the crawl frontier is persisted."
     }
 
-    if ($Script:CrawlEnabled -and $ThrottleLimit -gt 1) {
-        throw "Crawl mode currently requires -ThrottleLimit 1. Dynamic crawl frontiers are processed sequentially to keep depth, deduplication, and output writes deterministic."
-    }
-
     if ((-not $Script:CrawlEnabled) -and $FollowPathScope -ne "Any") {
         Write-Warning "-FollowPathScope is ignored when crawl mode is disabled (-FollowDepth 0)."
     }
@@ -6080,20 +6883,25 @@ try {
             throw "-RobotsUserAgent cannot be empty when -EnforceRobotsTxt is used. Use a product token such as AE-Find-WebLinks."
         }
         $RobotsUserAgent = $RobotsUserAgent.Trim()
-
-        if ($ThrottleLimit -gt 1) {
-            throw "-EnforceRobotsTxt currently requires -ThrottleLimit 1. robots.txt decisions are cached and applied deterministically only in sequential mode."
-        }
     }
 
+    # Parallel processing is a PowerShell 7+ feature. Decide once, up front, with a
+    # message that says what this host is and what to do about it.
+    $parallelSupport = Test-ParallelSupport -RequestedThrottleLimit $ThrottleLimit
+    if (-not $parallelSupport.Supported) {
+        throw $parallelSupport.Reason
+    }
     if ($ThrottleLimit -gt 1) {
-        if ($SourceType -ne "File") {
-            throw "-ThrottleLimit > 1 is only useful with SourceType File."
+        if ($SourceType -eq "Url" -and -not $Script:CrawlEnabled) {
+            Write-Warning "-ThrottleLimit $ThrottleLimit has no effect on a single URL without crawling; processing sequentially."
+            $ThrottleLimit = 1
         }
-        if ($PSVersionTable.PSVersion.Major -lt 7) {
-            throw "-ThrottleLimit > 1 requires PowerShell 7 or later. Current version: $($PSVersionTable.PSVersion)"
+        else {
+            Write-Host "Parallel mode: up to $ThrottleLimit URL(s) at a time on $($Script:HostDescription)."
         }
-        Write-Host "Parallel mode enabled: ThrottleLimit = $ThrottleLimit"
+    }
+    if ($null -ne $Script:RunDeadline) {
+        Write-Host "Run time limit: $MaxRunMinutes minute(s); the run stops starting new URLs at $($Script:RunDeadline.ToString('yyyy-MM-dd HH:mm:ss'))."
     }
 
     # Assign default progress file early so collision checks also cover it.
@@ -6341,7 +7149,7 @@ try {
     }
 
     if ($Mode -eq "New") {
-        Set-Content -LiteralPath $OutputFile -Value @() -Encoding UTF8
+        Set-Utf8NoBomFile -FilePath $OutputFile -Lines @()
         Write-Host "Output file created/overwritten: $OutputFile"
     }
     elseif (-not (Test-Path -LiteralPath $OutputFile)) {
@@ -6359,17 +7167,17 @@ try {
         $failedHeader = "SourceUrl`tError"
 
         if ($FailedUrlMode -eq "New") {
-            Set-Content -LiteralPath $FailedUrlFile -Value $failedHeader -Encoding UTF8
+            Set-Utf8NoBomFile -FilePath $FailedUrlFile -Lines $failedHeader
             Write-Host "Failed URL file created/overwritten: $FailedUrlFile"
         }
         elseif (-not (Test-Path -LiteralPath $FailedUrlFile)) {
-            Set-Content -LiteralPath $FailedUrlFile -Value $failedHeader -Encoding UTF8
+            Set-Utf8NoBomFile -FilePath $FailedUrlFile -Lines $failedHeader
             Write-Host "Failed URL file created: $FailedUrlFile"
         }
         else {
             $failedItem = Get-Item -LiteralPath $FailedUrlFile -ErrorAction Stop
             if ($failedItem.Length -eq 0) {
-                Set-Content -LiteralPath $FailedUrlFile -Value $failedHeader -Encoding UTF8
+                Set-Utf8NoBomFile -FilePath $FailedUrlFile -Lines $failedHeader
                 Write-Host "Failed URL file was empty; header added: $FailedUrlFile"
             }
         }
@@ -6385,17 +7193,17 @@ try {
         $csvHeader = "Timestamp,SourceUrl,Status,Extracted,Matched,Excluded,Blacklisted,Duplicates,Written,Error"
 
         if ($LogMode -eq "New") {
-            Set-Content -LiteralPath $LogCsv -Value $csvHeader -Encoding UTF8
+            Set-Utf8NoBomFile -FilePath $LogCsv -Lines $csvHeader
             Write-Host "Log CSV file created/overwritten: $LogCsv"
         }
         elseif (-not (Test-Path -LiteralPath $LogCsv)) {
-            Set-Content -LiteralPath $LogCsv -Value $csvHeader -Encoding UTF8
+            Set-Utf8NoBomFile -FilePath $LogCsv -Lines $csvHeader
             Write-Host "Log CSV file created: $LogCsv"
         }
         else {
             $logItem = Get-Item -LiteralPath $LogCsv -ErrorAction Stop
             if ($logItem.Length -eq 0) {
-                Set-Content -LiteralPath $LogCsv -Value $csvHeader -Encoding UTF8
+                Set-Utf8NoBomFile -FilePath $LogCsv -Lines $csvHeader
                 Write-Host "Log CSV file was empty; header added: $LogCsv"
             }
             else {
@@ -6485,7 +7293,7 @@ try {
                     # keys so duplicate checks work without stripping an already-stripped
                     # output line a second time.
                     [void]$writtenSet.TryAdd((Get-LinkKey -Link $line -KeepFragments $KeepFragments), [byte]0)
-                    if ($Script:StripRegexBeforeEvaluation) {
+                    if ($Script:StripRegexBeforeEvaluationEnabled) {
                         [void]$writtenSet.TryAdd((Get-LinkKey -Link $line -KeepFragments $KeepFragments -UseEvaluationValue $true), [byte]0)
                     }
                 }
@@ -6519,7 +7327,7 @@ try {
                         $normalized = ConvertTo-NormalizedLink -Link $blLine
                         if ($normalized) {
                             [void]$blacklistSet.TryAdd((Get-LinkKey -Link $normalized -KeepFragments $KeepFragments), [byte]0)
-                            if ($Script:StripRegexBeforeEvaluation) {
+                            if ($Script:StripRegexBeforeEvaluationEnabled) {
                                 [void]$blacklistSet.TryAdd((Get-LinkKey -Link $normalized -KeepFragments $KeepFragments -UseEvaluationValue $true), [byte]0)
                             }
                         }
@@ -6558,11 +7366,11 @@ try {
         Write-Host "Exclude pattern(s): $($effectiveExcludePatterns -join ', ')"
         Write-Host "Exclude mode: $ExcludeMode"
     }
-    if ($Script:StripRegexBeforeEvaluation) {
+    if ($Script:StripRegexBeforeEvaluationEnabled) {
         Write-Host "Link evaluation regex stripping: enabled. Regex removed before matching/output/dedup: $LinkEvaluationStripRegex"
     }
-    if ($Script:StuckUrlTimeoutSeconds -gt 0) {
-        Write-Host "Same-URL watchdog: restart URL after $($Script:StuckUrlTimeoutSeconds) second(s)."
+    if ($Script:StuckUrlWatchdogSeconds -gt 0) {
+        Write-Host "Same-URL watchdog: restart URL after $($Script:StuckUrlWatchdogSeconds) second(s)."
     }
     else {
         Write-Host "Same-URL watchdog: disabled."
@@ -6747,10 +7555,425 @@ try {
         }
     }
 
-    function Invoke-CrawlSequential {
+    # ------------------------------------------------------------------
+    # Crawl bookkeeping shared by the sequential loop and the parallel engine.
+    # A result carries Url, Depth, Status, Links, ExtractedCount, ErrorMsg and,
+    # when produced by Invoke-UrlFetchAndMatch, Stats. Parallel workers return
+    # no Stats because matching/writing is done here, centrally.
+    # ------------------------------------------------------------------
+    function Complete-CrawlResult {
+        param(
+            [Parameter(Mandatory = $true)]$Result,
+            [Parameter(Mandatory = $true)]$State
+        )
+
+        $itemUrl = [string]$Result.Url
+        $itemDepth = [int]$Result.Depth
+
+        if ($Result.Status -eq "OK") {
+            $links = @($Result.Links)
+            $stats = $null
+            if ($Result.PSObject.Properties['Stats']) { $stats = $Result.Stats }
+            if ($null -eq $stats) {
+                $stats = Write-MatchedLinks -Links $links -RegexList $searchRegexList `
+                            -SearchMode $SearchMode `
+                            -ExcludeRegexList $excludeRegexList -ExcludeMode $ExcludeMode `
+                            -OutFile $OutputFile -WrittenSet $writtenSet `
+                            -BlacklistSet $blacklistSet `
+                            -BlacklistScope $BlacklistScope `
+                            -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
+            }
+
+            $script:totalExtracted += $Result.ExtractedCount
+            $script:totalMatched += $stats.Matched
+            $script:totalExcluded += $stats.Excluded
+            $script:totalBlacklistOut += $stats.Blacklisted
+            $script:totalDupes += $stats.Duplicates
+            $script:totalWritten += $stats.Written
+
+            Write-Detail "  Extracted $($Result.ExtractedCount) link(s)."
+            Write-Host "  Matched: $($stats.Matched) | Excluded: $($stats.Excluded) | Blacklisted: $($stats.Blacklisted) | Duplicates: $($stats.Duplicates) | Written: $($stats.Written)"
+
+            Write-LogCsvRow -Url $itemUrl -Status "OK" `
+                -Extracted $Result.ExtractedCount -Matched $stats.Matched `
+                -Excluded $stats.Excluded -Blacklisted $stats.Blacklisted -Duplicates $stats.Duplicates `
+                -Written $stats.Written -ErrorMsg ""
+
+            if ($Script:FollowDepthUnlimited -or $itemDepth -lt $FollowDepth) {
+                $enqueuedThisPage = 0
+                foreach ($candidate in $links) {
+                    if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+
+                    $candidateUrl = ConvertTo-NormalizedLink -Link $candidate
+                    if (-not $candidateUrl) { continue }
+
+                    if (-not (Test-UrlAllowedForFollow `
+                        -Url $candidateUrl `
+                        -Scope $FollowScope `
+                        -Boundary $State.Boundary `
+                        -PathScope $FollowPathScope `
+                        -AllowSubdomains ([bool]$FollowSubdomains) `
+                        -MaxSubdomainDepthValue $MaxSubdomainDepth)) {
+                        continue
+                    }
+
+                    if ((Test-BlacklistAppliesToInput -Scope $BlacklistScope) -and (Test-IsBlacklisted -Url $candidateUrl -BlacklistSet $blacklistSet -KeepFragments $KeepFragments)) {
+                        continue
+                    }
+
+                    if ($MaxFollowPages -gt 0 -and $State.Scheduled.Count -ge $MaxFollowPages) {
+                        continue
+                    }
+
+                    $nextDepth = ($itemDepth + 1)
+                    if (Add-CrawlScheduledProgress -Path $ProgressFile -Url $candidateUrl -Depth $nextDepth -ScheduledSet $State.Scheduled) {
+                        $State.Queue.Enqueue([pscustomobject]@{ Url = $candidateUrl; Depth = $nextDepth })
+                        $enqueuedThisPage++
+                    }
+                }
+
+                if ($enqueuedThisPage -gt 0) {
+                    Write-Detail "  Enqueued $enqueuedThisPage crawl candidate(s) for next depth. Queue: $($State.Queue.Count). Scheduled total: $($State.Scheduled.Count)."
+                }
+                elseif ($MaxFollowPages -gt 0 -and $State.Scheduled.Count -ge $MaxFollowPages) {
+                    Write-Host "  Crawl page cap reached ($MaxFollowPages); no more candidates will be queued."
+                }
+            }
+
+            Add-CrawlCompletedProgress -Path $ProgressFile -Url $itemUrl -CompletedSet $State.Completed
+        }
+        elseif ($Result.Status -eq "ROBOTS_BLOCKED") {
+            $script:totalRobotsBlocked++
+            $robotsMessage = if ([string]::IsNullOrWhiteSpace($Result.ErrorMsg)) { "Blocked by robots.txt" } else { $Result.ErrorMsg }
+            Write-Host "  ROBOTS: $robotsMessage"
+            Write-Host "  Skipping this URL and continuing."
+
+            Write-LogCsvRow -Url $itemUrl -Status "ROBOTS_BLOCKED" `
+                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                -Written 0 -ErrorMsg $robotsMessage
+
+            Add-CrawlCompletedProgress -Path $ProgressFile -Url $itemUrl -CompletedSet $State.Completed
+        }
+        else {
+            $script:totalFailed++
+            $errorMessage = if ([string]::IsNullOrWhiteSpace($Result.ErrorMsg)) { "Unknown Network Error" } else { $Result.ErrorMsg }
+            if ($Result.Status -eq "ROBOTS_UNAVAILABLE") {
+                Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
+            }
+            else {
+                Write-Host "  FAILED: $errorMessage"
+            }
+            Write-Host "  Skipping this URL and continuing."
+
+            Write-LogCsvRow -Url $itemUrl -Status $Result.Status `
+                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                -Written 0 -ErrorMsg $errorMessage
+
+            Write-FailedUrlRow -Url $itemUrl -ErrorMsg $errorMessage
+        }
+    }
+
+    # File-mode result handler used by the parallel engine (the sequential File
+    # loop below keeps its own inline version of the same steps).
+    function Complete-FileResult {
+        param([Parameter(Mandatory = $true)]$Result)
+
+        $itemUrl = [string]$Result.Url
+
+        if ($Result.Status -eq "OK") {
+            $links = @($Result.Links)
+            $script:totalExtracted += $Result.ExtractedCount
+            Write-Detail "  Extracted $($Result.ExtractedCount) link(s)."
+
+            $stats = Write-MatchedLinks -Links $links -RegexList $searchRegexList `
+                        -SearchMode $SearchMode `
+                        -ExcludeRegexList $excludeRegexList -ExcludeMode $ExcludeMode `
+                        -OutFile $OutputFile -WrittenSet $writtenSet `
+                        -BlacklistSet $blacklistSet `
+                        -BlacklistScope $BlacklistScope `
+                        -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
+            $script:totalMatched += $stats.Matched
+            $script:totalExcluded += $stats.Excluded
+            $script:totalBlacklistOut += $stats.Blacklisted
+            $script:totalDupes += $stats.Duplicates
+            $script:totalWritten += $stats.Written
+
+            Write-Host "  Matched: $($stats.Matched) | Excluded: $($stats.Excluded) | Blacklisted: $($stats.Blacklisted) | Duplicates: $($stats.Duplicates) | Written: $($stats.Written)"
+
+            Write-LogCsvRow -Url $itemUrl -Status "OK" `
+                -Extracted $Result.ExtractedCount -Matched $stats.Matched `
+                -Excluded $stats.Excluded -Blacklisted $stats.Blacklisted -Duplicates $stats.Duplicates `
+                -Written $stats.Written -ErrorMsg ""
+
+            if ($ProgressFile -and $completedSourceSet) {
+                Add-CompletedProgress `
+                    -Path $ProgressFile `
+                    -Url $itemUrl `
+                    -CompletedSet $completedSourceSet `
+                    -KeepFragments ([bool]$KeepFragments)
+            }
+        }
+        elseif ($Result.Status -eq "ROBOTS_BLOCKED") {
+            $script:totalRobotsBlocked++
+            $errorMessage = [string]$Result.ErrorMsg
+            Write-Host "  ROBOTS: $errorMessage"
+            Write-Host "  Skipping this URL and continuing."
+
+            Write-LogCsvRow -Url $itemUrl -Status "ROBOTS_BLOCKED" `
+                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                -Written 0 -ErrorMsg $errorMessage
+        }
+        else {
+            $script:totalFailed++
+            $errorMessage = if ([string]::IsNullOrWhiteSpace($Result.ErrorMsg)) { "Unknown Network Error" } else { $Result.ErrorMsg }
+            if ($Result.Status -eq "ROBOTS_UNAVAILABLE") {
+                Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
+            }
+            else {
+                Write-Host "  FAILED: $errorMessage"
+            }
+            Write-Host "  Skipping this URL and continuing."
+
+            Write-LogCsvRow -Url $itemUrl -Status $Result.Status `
+                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                -Written 0 -ErrorMsg $errorMessage
+
+            Write-FailedUrlRow -Url $itemUrl -ErrorMsg $errorMessage
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Parallel engine (PowerShell 7+). Worker runspaces only download and
+    # extract; the parent does matching, writing, logging, progress, and crawl
+    # scheduling, so every file has exactly one writer. Each worker's console
+    # output is captured and replayed under its URL, so lines never interleave.
+    # ------------------------------------------------------------------
+    function New-WorkerSessionState {
+        # Compile once in the parent before workers share the process/type table.
+        # Concurrent first-use Add-Type calls would otherwise race.
+        if ($Script:PSMajorVersion -ge 7) { Initialize-CoreHttpTransport }
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+
+        # Export every top-level function of this script from its own source, so
+        # there is no hand-maintained list that can drift from the call graph.
+        # Nested helpers inside this main block (logging, crawl, engine) are
+        # parent-only and are not exported.
+        $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
+        $topLevelFunctions = @($scriptAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] })
+        $definitionsText = New-Object System.Text.StringBuilder
+        foreach ($functionAst in $topLevelFunctions) {
+            $definition = (Get-Item -LiteralPath "function:$($functionAst.Name)").ScriptBlock.ToString()
+            [void]$definitionsText.AppendLine($definition)
+            $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($functionAst.Name, $definition))
+        }
+
+        # Give the worker every $Script: variable those functions read, with the
+        # parent's current value (reference types such as the robots.txt cache and
+        # the compiled regexes are shared, which is what we want). Evaluation
+        # stripping is switched off in workers: the parent applies it centrally.
+        $parentOnly = @('StripRegexBeforeEvaluationEnabled', 'LinkEvaluationStripRegexObject', 'LinkEvaluationStripRegexText', 'LinkEvaluationStripRegexWarned')
+        $variableNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($match in [regex]::Matches($definitionsText.ToString(), '\$Script:([A-Za-z_][A-Za-z0-9_]*)')) {
+            [void]$variableNames.Add($match.Groups[1].Value)
+        }
+        foreach ($variableName in $variableNames) {
+            if ($parentOnly -contains $variableName) { continue }
+            $variable = Get-Variable -Name $variableName -Scope Script -ErrorAction SilentlyContinue
+            if ($null -eq $variable) { continue }
+            $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($variableName, $variable.Value, $null))
+        }
+        $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('StripRegexBeforeEvaluationEnabled', $false, $null))
+        $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('LinkEvaluationStripRegexObject', $null, $null))
+        $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('LinkEvaluationStripRegexText', $null, $null))
+        $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('LinkEvaluationStripRegexWarned', $false, $null))
+
+        return $iss
+    }
+
+    # Runs inside a worker runspace. Only fetch + extract; return one result object.
+    $Script:ParallelWorkerScript = {
+        param($WorkItem, $Cfg)
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
+                -PageUrl $WorkItem.Url `
+                -MaxRetries $Cfg.RetryCount `
+                -WaitSec $Cfg.WaitSeconds `
+                -TimeoutSec $Cfg.TimeoutSeconds `
+                -DoSecondFetch ([bool]$Cfg.SecondFetch) `
+                -SecondWaitSec $Cfg.SecondFetchWait `
+                -UserAgentString $Cfg.UserAgent `
+                -ProxyUrl $Cfg.Proxy `
+                -MaxRedirectsCount $Cfg.MaxRedirects `
+                -MaxRetryAfterSecondsValue $Cfg.MaxRetryAfterSeconds `
+                -EnforceRobotsTxt ([bool]$Cfg.EnforceRobotsTxt) `
+                -RobotsUserAgentValue $Cfg.RobotsUserAgent `
+                -MaxPageContentBytesValue $Cfg.MaxPageContentBytes `
+                -MaxPageContentMBValue $Cfg.MaxPageContentMB)
+
+            [pscustomobject]@{
+                Url            = $WorkItem.Url
+                Depth          = $WorkItem.Depth
+                Status         = "OK"
+                Links          = $links
+                ExtractedCount = $links.Count
+                ErrorMsg       = ""
+                Seconds        = $stopwatch.Elapsed.TotalSeconds
+            }
+        }
+        catch {
+            $status = if (Test-IsRobotsTxtBlockedError $_) { "ROBOTS_BLOCKED" }
+                      elseif (Test-IsRobotsTxtUnavailableError $_) { "ROBOTS_UNAVAILABLE" }
+                      else { "FAILED" }
+
+            [pscustomobject]@{
+                Url            = $WorkItem.Url
+                Depth          = $WorkItem.Depth
+                Status         = $status
+                Links          = @()
+                ExtractedCount = 0
+                ErrorMsg       = $_.Exception.Message
+                Seconds        = $stopwatch.Elapsed.TotalSeconds
+            }
+        }
+    }
+
+    function Invoke-ParallelEngine {
+        param(
+            [Parameter(Mandatory = $true)][System.Collections.Generic.Queue[object]]$Queue,
+            [Parameter(Mandatory = $true)][scriptblock]$OnResult,
+            [int]$Workers = 2,
+            [bool]$ShowDepth = $false
+        )
+
+        $cfg = @{
+            RetryCount           = $RetryCount
+            WaitSeconds          = $WaitSeconds
+            TimeoutSeconds       = $TimeoutSeconds
+            SecondFetch          = [bool]$SecondFetch
+            SecondFetchWait      = $SecondFetchWait
+            UserAgent            = $UserAgent
+            Proxy                = $Proxy
+            MaxRedirects         = $Script:MaxRedirects
+            MaxRetryAfterSeconds = $Script:MaxRetryAfterSeconds
+            EnforceRobotsTxt     = [bool]$EnforceRobotsTxt
+            RobotsUserAgent      = $RobotsUserAgent
+            MaxPageContentBytes  = $Script:MaxPageContentBytes
+            MaxPageContentMB     = $Script:MaxPageContentMB
+        }
+
+        $sessionState = New-WorkerSessionState
+        $pool = [runspacefactory]::CreateRunspacePool($sessionState)
+        [void]$pool.SetMinRunspaces(1)
+        [void]$pool.SetMaxRunspaces($Workers)
+        $pool.Open()
+
+        $workerText = $Script:ParallelWorkerScript.ToString()
+        $active = [System.Collections.Generic.List[object]]::new()
+        $dispatched = 0
+        $completedCount = 0
+        $nextDispatchAt = [datetime]::MinValue
+
+        try {
+            while ($Queue.Count -gt 0 -or $active.Count -gt 0) {
+                # Dispatch up to $Workers items. -DelaySeconds/-DelayJitterSeconds space
+                # out request starts across the pool instead of sleeping inside workers.
+                while ($active.Count -lt $Workers -and $Queue.Count -gt 0) {
+                    if (Test-RunDeadlineReached) { $Queue.Clear(); break }
+                    if ((Get-Date) -lt $nextDispatchAt) { break }
+
+                    $item = $Queue.Dequeue()
+                    $dispatched++
+                    $depthText = if ($ShowDepth) { " depth $($item.Depth)/$($Script:FollowDepthDisplay)" } else { "" }
+                    Write-Detail "[$dispatched] Starting$($depthText): $($item.Url)"
+
+                    $worker = [powershell]::Create()
+                    $worker.RunspacePool = $pool
+                    [void]$worker.AddScript($workerText).AddArgument($item).AddArgument($cfg)
+                    $active.Add([pscustomobject]@{
+                        PowerShell = $worker
+                        Handle     = $worker.BeginInvoke()
+                        Item       = $item
+                        Started    = (Get-Date)
+                    })
+
+                    $spacing = Get-InterUrlDelaySeconds -BaseSeconds $DelaySeconds
+                    if ($spacing -gt 0) { $nextDispatchAt = (Get-Date).AddSeconds($spacing) }
+                }
+
+                $finished = @($active | Where-Object { $_.Handle.IsCompleted })
+                if ($finished.Count -eq 0) {
+                    # Short sleeps keep Ctrl+C responsive; the finally block stops workers.
+                    Start-Sleep -Milliseconds 100
+                    continue
+                }
+
+                foreach ($entry in $finished) {
+                    [void]$active.Remove($entry)
+                    $result = $null
+
+                    try {
+                        $output = @($entry.PowerShell.EndInvoke($entry.Handle))
+                        $result = $output | Where-Object { $null -ne $_ } | Select-Object -Last 1
+                    }
+                    catch {
+                        if (Test-IsCancellationException $_) { throw }
+                        $result = [pscustomobject]@{
+                            Url = $entry.Item.Url; Depth = $entry.Item.Depth; Status = "FAILED"; Links = @()
+                            ExtractedCount = 0; ErrorMsg = "Worker error: $($_.Exception.Message)"; Seconds = 0
+                        }
+                    }
+
+                    if ($null -eq $result) {
+                        $workerErrors = @($entry.PowerShell.Streams.Error | ForEach-Object { $_.ToString() })
+                        $message = if ($workerErrors.Count -gt 0) { $workerErrors -join "; " } else { "Worker returned no result." }
+                        $result = [pscustomobject]@{
+                            Url = $entry.Item.Url; Depth = $entry.Item.Depth; Status = "FAILED"; Links = @()
+                            ExtractedCount = 0; ErrorMsg = "Worker error: $message"; Seconds = 0
+                        }
+                    }
+
+                    $completedCount++
+                    $elapsedText = if ($result.PSObject.Properties['Seconds'] -and $result.Seconds -gt 0) { " ({0:0.0}s)" -f [double]$result.Seconds } else { "" }
+                    $depthText = if ($ShowDepth) { " depth $($entry.Item.Depth)/$($Script:FollowDepthDisplay)" } else { "" }
+                    Write-Host "[$completedCount done, $($active.Count) running, $($Queue.Count) queued]$depthText$($elapsedText): $($entry.Item.Url)"
+
+                    # Replay the worker's own console lines under its URL.
+                    if (-not $Script:QuietMode) {
+                        foreach ($record in $entry.PowerShell.Streams.Information) {
+                            Write-Host "    $($record.MessageData)"
+                        }
+                    }
+                    foreach ($record in $entry.PowerShell.Streams.Warning) {
+                        Write-Warning "$($entry.Item.Url): $($record.Message)"
+                    }
+
+                    $entry.PowerShell.Dispose()
+
+                    & $OnResult $result
+                    Write-Host ""
+                }
+            }
+        }
+        finally {
+            foreach ($entry in $active) {
+                try { $entry.PowerShell.Stop() } catch { }
+                try { $entry.PowerShell.Dispose() } catch { }
+            }
+            try { $pool.Close() } catch { }
+            try { $pool.Dispose() } catch { }
+        }
+    }
+
+    function Invoke-CrawlRun {
         param(
             [Parameter(Mandatory = $true)][string[]]$SeedUrls,
-            [switch]$SingleSeedMode
+            [int]$Workers = 1
         )
 
         $boundary = New-FollowBoundary -SeedUrls $SeedUrls -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
@@ -6829,109 +8052,34 @@ try {
             Write-Host "Crawl boundary hosts: $($boundary.Hosts.Count); root domain(s): $($boundary.Domains.Count)"
         }
 
+        $crawlState = [pscustomobject]@{
+            Queue     = $queue
+            Scheduled = $scheduled
+            Completed = $crawlCompleted
+            Boundary  = $boundary
+        }
+
+        if ($Workers -gt 1) {
+            Invoke-ParallelEngine -Queue $queue -Workers $Workers -ShowDepth $true -OnResult {
+                param($workerResult)
+                Complete-CrawlResult -Result $workerResult -State $crawlState
+            }
+            return
+        }
+
         $fetchIndex = 0
         while ($queue.Count -gt 0) {
+            if (Test-RunDeadlineReached) { break }
+
             $item = $queue.Dequeue()
             $fetchIndex++
 
             Write-Host "[$fetchIndex] Fetching depth $($item.Depth)/$($Script:FollowDepthDisplay): $($item.Url)"
             $result = Invoke-UrlFetchAndMatch -Url $item.Url -Depth ([int]$item.Depth)
+            Complete-CrawlResult -Result $result -State $crawlState
 
-            if ($result.Status -eq "OK") {
-                $links = @($result.Links)
-                $stats = $result.Stats
-
-                $script:totalExtracted += $result.ExtractedCount
-                $script:totalMatched += $stats.Matched
-                $script:totalExcluded += $stats.Excluded
-                $script:totalBlacklistOut += $stats.Blacklisted
-                $script:totalDupes += $stats.Duplicates
-                $script:totalWritten += $stats.Written
-
-                Write-Host "  Extracted $($result.ExtractedCount) link(s)."
-                Write-Host "  Matched: $($stats.Matched) | Excluded: $($stats.Excluded) | Blacklisted: $($stats.Blacklisted) | Duplicates: $($stats.Duplicates) | Written: $($stats.Written)"
-
-                Write-LogCsvRow -Url $item.Url -Status "OK" `
-                    -Extracted $result.ExtractedCount -Matched $stats.Matched `
-                    -Excluded $stats.Excluded -Blacklisted $stats.Blacklisted -Duplicates $stats.Duplicates `
-                    -Written $stats.Written -ErrorMsg ""
-
-                if ($Script:FollowDepthUnlimited -or [int]$item.Depth -lt $FollowDepth) {
-                    $enqueuedThisPage = 0
-                    foreach ($candidate in $links) {
-                        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-
-                        $candidateUrl = ConvertTo-NormalizedLink -Link $candidate
-                        if (-not $candidateUrl) { continue }
-
-                        if (-not (Test-UrlAllowedForFollow `
-                            -Url $candidateUrl `
-                            -Scope $FollowScope `
-                            -Boundary $boundary `
-                            -PathScope $FollowPathScope `
-                            -AllowSubdomains ([bool]$FollowSubdomains) `
-                            -MaxSubdomainDepthValue $MaxSubdomainDepth)) {
-                            continue
-                        }
-
-                        if ((Test-BlacklistAppliesToInput -Scope $BlacklistScope) -and (Test-IsBlacklisted -Url $candidateUrl -BlacklistSet $blacklistSet -KeepFragments $KeepFragments)) {
-                            continue
-                        }
-
-                        if ($MaxFollowPages -gt 0 -and $scheduled.Count -ge $MaxFollowPages) {
-                            continue
-                        }
-
-                        $nextDepth = ([int]$item.Depth + 1)
-                        if (Add-CrawlScheduledProgress -Path $ProgressFile -Url $candidateUrl -Depth $nextDepth -ScheduledSet $scheduled) {
-                            $queue.Enqueue([pscustomobject]@{ Url = $candidateUrl; Depth = $nextDepth })
-                            $enqueuedThisPage++
-                        }
-                    }
-
-                    if ($enqueuedThisPage -gt 0) {
-                        Write-Host "  Enqueued $enqueuedThisPage crawl candidate(s) for next depth. Queue: $($queue.Count). Scheduled total: $($scheduled.Count)."
-                    }
-                    elseif ($MaxFollowPages -gt 0 -and $scheduled.Count -ge $MaxFollowPages) {
-                        Write-Host "  Crawl page cap reached ($MaxFollowPages); no more candidates will be queued."
-                    }
-                }
-
-                Add-CrawlCompletedProgress -Path $ProgressFile -Url $item.Url -CompletedSet $crawlCompleted
-            }
-            elseif ($result.Status -eq "ROBOTS_BLOCKED") {
-                $script:totalRobotsBlocked++
-                $robotsMessage = if ([string]::IsNullOrWhiteSpace($result.ErrorMsg)) { "Blocked by robots.txt" } else { $result.ErrorMsg }
-                Write-Host "  ROBOTS: $robotsMessage"
-                Write-Host "  Skipping this URL and continuing."
-
-                Write-LogCsvRow -Url $item.Url -Status "ROBOTS_BLOCKED" `
-                    -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                    -Written 0 -ErrorMsg $robotsMessage
-
-                Add-CrawlCompletedProgress -Path $ProgressFile -Url $item.Url -CompletedSet $crawlCompleted
-            }
-            else {
-                $script:totalFailed++
-                $errorMessage = if ([string]::IsNullOrWhiteSpace($result.ErrorMsg)) { "Unknown Network Error" } else { $result.ErrorMsg }
-                if ($result.Status -eq "ROBOTS_UNAVAILABLE") {
-                    Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
-                }
-                else {
-                    Write-Host "  FAILED: $errorMessage"
-                }
-                Write-Host "  Skipping this URL and continuing."
-
-                Write-LogCsvRow -Url $item.Url -Status $result.Status `
-                    -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                    -Written 0 -ErrorMsg $errorMessage
-
-                Write-FailedUrlRow -Url $item.Url -ErrorMsg $errorMessage
-            }
-
-            if ($queue.Count -gt 0 -and $DelaySeconds -gt 0) {
-                Write-Host "  Waiting $DelaySeconds second(s) before next URL ..."
-                Start-Sleep -Seconds $DelaySeconds
+            if ($queue.Count -gt 0 -and ($DelaySeconds -gt 0 -or $Script:DelayJitterSecondsValue -gt 0)) {
+                Start-InterUrlDelay -BaseSeconds $DelaySeconds
             }
 
             Write-Host ""
@@ -6940,7 +8088,7 @@ try {
 
     if ($Script:CrawlEnabled) {
         if ($SourceType -eq "Url") {
-            Invoke-CrawlSequential -SeedUrls @($validatedSingleSourceUrl) -SingleSeedMode
+            Invoke-CrawlRun -SeedUrls @($validatedSingleSourceUrl) -Workers $ThrottleLimit
         }
         elseif ($SourceType -eq "File") {
             Write-Host "Reading crawl seed URLs from file: $Source"
@@ -7011,7 +8159,7 @@ try {
                 throw "No valid crawl seed URLs found in input file."
             }
 
-            Invoke-CrawlSequential -SeedUrls ([string[]]$seedUrls.ToArray())
+            Invoke-CrawlRun -SeedUrls ([string[]]$seedUrls.ToArray()) -Workers $ThrottleLimit
         }
         else {
             throw "Unsupported SourceType: $SourceType"
@@ -7049,7 +8197,7 @@ try {
                     -MaxPageContentBytesValue $Script:MaxPageContentBytes `
                     -MaxPageContentMBValue $Script:MaxPageContentMB)
                 $totalExtracted = $links.Count
-                Write-Host "  Extracted $($links.Count) link(s)."
+                Write-Detail "  Extracted $($links.Count) link(s)."
 
                 $stats = Write-MatchedLinks -Links $links -RegexList $searchRegexList `
                             -SearchMode $SearchMode `
@@ -7257,375 +8405,116 @@ try {
             Write-Host ""
         }
 
-        if ($urls.Count -gt 0) {
-            if ($ThrottleLimit -gt 1) {
-                # ---------------------------------------------------------------
-                # Parallel mode (PS 7+ only)
-                # Workers only fetch pages and extract links.
-                # The parent thread handles filtering, writing, logging,
-                # and progress centrally to avoid file-lock races.
-                # ---------------------------------------------------------------
-                # Load the functions required by worker-side fetch/extract logic.
-                # The list is the transitive closure of Get-LinksFromWebPage's call
-                # graph, plus Get-LinkKey which serves as the runspace-initialised
-                # canary tested below. Keep this list aligned with that closure
-                # whenever helpers are added or removed -- a missing entry causes
-                # parallel mode to fail with a "command not found" error inside
-                # the worker, which is hard to diagnose from the parent.
-                $funcNames = @(
-                    'Get-LinkKey', 'Get-LinkEvaluationValue', 'Test-IsLikelyRelativeAssetPath', 'Limit-NormalizedLinkLength', 'ConvertTo-NormalizedLink',
-                    'ConvertFrom-JsUrl', 'Invoke-WebRequestWithRetry',
-                    'Get-RobotsOriginKey', 'Get-RobotsTxtUrlForUrl', 'Get-RobotsPathAndQuery',
-                    'New-RobotsPathRule', 'Add-RobotsGroupIfPresent', 'ConvertFrom-RobotsTxt',
-                    'Test-RobotsAgentMatches', 'Get-RobotsApplicableRules', 'Test-RobotsPathMatchesPattern',
-                    'Test-RobotsPathAllowedByRules', 'New-RobotsPolicyObject', 'Get-RobotsHttpStatusFromErrorMessage',
-                    'Get-RobotsPolicyForUrl', 'Test-RobotsTxtAllowed', 'Assert-RobotsTxtAllowsUrl',
-                    'Test-IsRobotsTxtBlockedError', 'Test-IsRobotsTxtUnavailableError',
-                    'Get-LinksFromWebPage', 'Invoke-GetLinksFromWebPageWithWatchdog', 'Close-BaseResponseSafe',
-                    'Test-IsCancellationException', 'Test-IsInvalidWebRequestStateError', 'Test-IsStuckUrlTimeoutError',
-                    'Assert-StuckUrlWatchdog', 'Get-StuckUrlRemainingSeconds', 'Get-StuckUrlBoundedTimeoutSeconds', 'Start-SleepWithStuckUrlWatchdog',
-                    'Test-IsPrivateIPAddress', 'Test-IsPrivateUrl', 'Resolve-SearchEngineLink',
-                    'New-FindWebLinksRequestSession', 'Get-RedirectTargetViaRawRequest', 'Get-FindWebLinksProxyParameters',
-                    'Get-ResponseStatusCode', 'Get-ResponseHeaderValue',
-                    'Get-ResponseMediaType', 'Test-IsSupportedTextMediaType',
-                    'Get-ErrorResponse', 'Get-ResponseFinalUrl', 'Get-ResponseContentText', 'Get-ResponseContentLengthSafe',
-                    'Get-RegexMatchesSafe', 'Get-RegexFirstMatchSafe', 'Test-IsRegexTimeoutException',
-                    'Split-SrcsetValue', 'Add-FoundLinkCandidate'
-                )
-                $funcDefs = @{}
-                foreach ($fn in $funcNames) {
-                    $funcDefs[$fn] = (Get-Item "function:$fn").ScriptBlock.ToString()
-                }
-
-                # Hide -Parallel from PS 5.1 parser using dynamic scriptblock
-                # URL iteration is inside the string so dot-sourcing gives direct
-                # scope access to $urls/$funcDefs without $input buffering.
-                $parallelCode = @'
-                $urls | ForEach-Object {
-                    [pscustomobject]@{
-                        Url             = $_
-                        FuncDefs        = $funcDefs
-                        RetryCount      = $RetryCount
-                        WaitSeconds     = $WaitSeconds
-                        TimeoutSeconds  = $TimeoutSeconds
-                        SecondFetch     = $SecondFetch
-                        SecondFetchWait = $SecondFetchWait
-                        UserAgent       = $UserAgent
-                        Proxy           = $Proxy
-                        DelaySeconds    = $DelaySeconds
-                        KeepFragments   = [bool]$KeepFragments
-                        # Recreate MaxUrlLength in worker state because
-                        # Limit-NormalizedLinkLength (called transitively via
-                        # ConvertTo-NormalizedLink from Get-LinksFromWebPage and
-                        # Invoke-WebRequestWithRetry) reads it from Script scope.
-                        # Without this propagation a worker would silently use 0.
-                        MaxUrlLength    = $Script:MaxUrlLength
-                        MaxRedirects    = $Script:MaxRedirects
-                        MaxRetryAfterSeconds = $Script:MaxRetryAfterSeconds
-                        MaxPageContentMB = $Script:MaxPageContentMB
-                        MaxPageContentBytes = $Script:MaxPageContentBytes
-                        EnforceRobotsTxt = [bool]$EnforceRobotsTxt
-                        RobotsUserAgent = $RobotsUserAgent
-                        MaxRobotsTxtBytes = $Script:MaxRobotsTxtBytes
-                        RegexTimeoutSeconds = $RegexTimeoutSeconds
-                        DnsResolutionTimeoutSeconds = $Script:DnsResolutionTimeoutSeconds
-                        StuckUrlTimeoutSeconds = $Script:StuckUrlTimeoutSeconds
-                    }
-                } | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-                    $url = $_.Url
-
-                    # Recreate operational limits used by worker functions.
-                    $Script:MaxUrlLength = $_.MaxUrlLength
-                    $Script:MaxRedirects = $_.MaxRedirects
-                    $Script:MaxRetryAfterSeconds = $_.MaxRetryAfterSeconds
-                    $Script:MaxPageContentBytes = $_.MaxPageContentBytes
-                    $Script:MaxPageContentMB = $_.MaxPageContentMB
-                    $Script:MaxRobotsTxtBytes = $_.MaxRobotsTxtBytes
-                    $Script:RobotsTxtCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    $Script:DnsResolutionTimeoutSeconds = $_.DnsResolutionTimeoutSeconds
-                    $Script:StuckUrlTimeoutSeconds = $_.StuckUrlTimeoutSeconds
-                    $Script:RegexTimeout = if ($_.RegexTimeoutSeconds -eq 0) {
-                        [System.Text.RegularExpressions.Regex]::InfiniteMatchTimeout
-                    }
-                    else {
-                        [TimeSpan]::FromSeconds($_.RegexTimeoutSeconds)
-                    }
-                    # Parallel workers only fetch/extract. Link-evaluation stripping is
-                    # applied centrally in the parent thread when results are written.
-                    $Script:StripRegexBeforeEvaluation = $false
-                    $Script:LinkEvaluationStripRegexText = $null
-                    $Script:LinkEvaluationStripRegexObject = $null
-                    $Script:LinkEvaluationStripRegexWarned = $false
-
-                    # Recreate functions and regexes in this runspace (only once per worker)
-                    $defs = $_.FuncDefs
-                    if (-not (Test-Path "function:Get-LinkKey" -ErrorAction SilentlyContinue)) {
-                        foreach ($entry in $defs.GetEnumerator()) {
-                            Set-Item "function:$($entry.Key)" -Value ([scriptblock]::Create($entry.Value))
-                        }
-
-                        # Compile regexes once per worker (live .NET objects cannot cross runspace boundaries)
-                        $cOpts = [System.Text.RegularExpressions.RegexOptions]::Compiled -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::ExplicitCapture
-                        $tOut = $Script:RegexTimeout
-                        $global:RegexTimeout = $tOut
-                        $global:RegexAttr = [regex]::new('\b(?<attr>href|src|action|data-href|data-url|data-src|data-link|data-redirect|formaction|poster|srcset)\s*=\s*["''](?<url>[^"'']+)["'']', $cOpts, $tOut)
-                        $global:RegexUnquotedAttr = [regex]::new('\b(?<attr>href|src|action|data-href|data-url|data-src|data-link|data-redirect|formaction|poster|srcset)\s*=\s*(?<url>[^\s"''>]+)', $cOpts, $tOut)
-                        $global:RegexRawUrl = [regex]::new('(?x)(?:https?://[^\s<>"''\)\]\}]+|//[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d+)?(?:[/?#][^\s<>"''\)\]\}]*)?|www\.[^\s<>"''\)\]\}]+|(?<![@/\w.-])[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d+)?(?:[/?#][^\s<>"''\)\]\}]*)?)', $cOpts, $tOut)
-                        $global:RegexScript = [regex]::new('<script[^>]*>(?<body>.*?)</script>', $cOpts -bor [System.Text.RegularExpressions.RegexOptions]::Singleline, $tOut)
-                        $global:RegexJsUrl = [regex]::new('(?:"|''|`)(?<url>(?:https?:)?(?:\\?/){2}[^"''`\s]{5,})(?:"|''|`)', $cOpts, $tOut)
-                        $global:RegexJsonPath = [regex]::new('"[^"]*"\s*:\s*"(?<url>\\?/[^"]{2,}|https?:\\?/\\?/[^"]+)"', $cOpts, $tOut)
-                        $global:RegexNoscript = [regex]::new('<noscript[^>]*>(?<body>.*?)</noscript>', $cOpts -bor [System.Text.RegularExpressions.RegexOptions]::Singleline, $tOut)
-                        $global:RegexCssUrl = [regex]::new('url\(\s*["'']?(?<url>[^"''\)\s]+)["'']?\s*\)', $cOpts, $tOut)
-                        $global:RegexMetaRefresh = [regex]::new('<meta\b(?=[^>]*http-equiv\s*=\s*["'']?refresh["'']?)(?=[^>]*content\s*=\s*["'']?\s*\d+\s*;\s*url\s*=\s*["'']*(?<url>[^"''\s>]+))[^>]*>', $cOpts -bor [System.Text.RegularExpressions.RegexOptions]::Singleline, $tOut)
-                        $global:RegexBaseHref = [regex]::new('<base[^>]+href\s*=\s*(?:["''](?<href>[^"'']+)["'']|(?<href>[^\s"''>]+))', $cOpts, $tOut)
-                        $global:RegexMetaContentUrl = [regex]::new('<meta[^>]+content\s*=\s*["''](?<url>https?://[^"'']+)["'']', $cOpts, $tOut)
-                        $global:RegexStyleImport = [regex]::new('@import\s+(?:url\()?\s*["'']?(?<url>[^"''\)\s;]+)["'']?\s*\)?', $cOpts, $tOut)
-                    }
-
-                    $ProgressPreference = 'SilentlyContinue'
-                    $ErrorActionPreference = 'Stop'
-                    $WarningPreference = 'SilentlyContinue'
-                    $InformationPreference = 'SilentlyContinue'
-                    $VerbosePreference = 'SilentlyContinue'
-
-                    # Rate-limit: stagger parallel requests if DelaySeconds is set
-                    $delaySeconds = [double]$_.DelaySeconds
-                    if ($delaySeconds -gt 0) {
-                        $maxDelayMsLong = [int64][Math]::Min(($delaySeconds * 1000.0), [double]([int]::MaxValue - 1))
-                        if ($maxDelayMsLong -gt 0) {
-                            $maxDelayMs = [int]$maxDelayMsLong
-                            Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum $maxDelayMs)
-                        }
-                    }
-
-                    try {
-                        $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
-                            -PageUrl $url `
-                            -MaxRetries $_.RetryCount `
-                            -WaitSec $_.WaitSeconds `
-                            -TimeoutSec $_.TimeoutSeconds `
-                            -DoSecondFetch ([bool]$_.SecondFetch) `
-                            -SecondWaitSec $_.SecondFetchWait `
-                            -UserAgentString $_.UserAgent `
-                            -ProxyUrl $_.Proxy `
-                            -MaxRedirectsCount $_.MaxRedirects `
-                            -MaxRetryAfterSecondsValue $_.MaxRetryAfterSeconds `
-                            -EnforceRobotsTxt ([bool]$_.EnforceRobotsTxt) `
-                            -RobotsUserAgentValue $_.RobotsUserAgent `
-                            -MaxPageContentBytesValue $_.MaxPageContentBytes `
-                            -MaxPageContentMBValue $_.MaxPageContentMB)
-                        Write-Host "[parallel] OK: $url -- Extracted $($links.Count) link(s)"
-
-                        [pscustomobject]@{
-                            Url            = $url
-                            Links          = $links
-                            ExtractedCount = $links.Count
-                            Status         = "OK"
-                            ErrorMsg       = ""
-                        }
-                    }
-                    catch {
-                        if (Test-IsCancellationException $_) { throw }
-
-                        $status = if (Test-IsRobotsTxtBlockedError $_) {
-                            "ROBOTS_BLOCKED"
-                        }
-                        elseif (Test-IsRobotsTxtUnavailableError $_) {
-                            "ROBOTS_UNAVAILABLE"
-                        }
-                        else {
-                            "FAILED"
-                        }
-
-                        if ($status -eq "ROBOTS_BLOCKED") {
-                            Write-Host "[parallel] ROBOTS: $url -- $($_.Exception.Message)"
-                        }
-                        elseif ($status -eq "ROBOTS_UNAVAILABLE") {
-                            Write-Host "[parallel] ROBOTS UNAVAILABLE: $url -- $($_.Exception.Message)"
-                        }
-                        else {
-                            Write-Host "[parallel] FAILED: $url -- $($_.Exception.Message)"
-                        }
-
-                        [pscustomobject]@{
-                            Url            = $url
-                            Links          = @()
-                            ExtractedCount = 0
-                            Status         = $status
-                            ErrorMsg       = $_.Exception.Message
-                        }
-                    }
-                } | ForEach-Object {
-                    # Parent thread: filter, write, log, progress — all central, no races
-                    $r = $_
-
-                    try {
-                    if ($r.Status -eq "OK") {
-                        $resultLinks = @($r.Links)
-                        $extractedCount = if ($null -ne $r.PSObject.Properties['ExtractedCount']) { [int]$r.ExtractedCount } else { $resultLinks.Count }
-                        $totalExtracted += $extractedCount
-                        Write-Host "Fetched: $($r.Url) (Extracted $extractedCount link(s))"
-
-                        $stats = Write-MatchedLinks -Links $resultLinks -RegexList $searchRegexList `
-                                    -SearchMode $SearchMode `
-                                    -ExcludeRegexList $excludeRegexList -ExcludeMode $ExcludeMode `
-                                    -OutFile $OutputFile -WrittenSet $writtenSet `
-                                    -BlacklistSet $blacklistSet `
-                                    -BlacklistScope $BlacklistScope `
-                                    -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
-                        $totalMatched      += $stats.Matched
-                        $totalExcluded     += $stats.Excluded
-                        $totalBlacklistOut += $stats.Blacklisted
-                        $totalDupes        += $stats.Duplicates
-                        $totalWritten      += $stats.Written
-
-                        Write-Host "  Matched: $($stats.Matched) | Excluded: $($stats.Excluded) | Blacklisted: $($stats.Blacklisted) | Duplicates: $($stats.Duplicates) | Written: $($stats.Written) -- $($r.Url)"
-
-                        Write-LogCsvRow -Url $r.Url -Status "OK" `
-                            -Extracted $extractedCount -Matched $stats.Matched `
-                            -Excluded $stats.Excluded -Blacklisted $stats.Blacklisted -Duplicates $stats.Duplicates `
-                            -Written $stats.Written -ErrorMsg ""
-                    }
-                    else {
-                        $totalFailed++
-                        $safeErrorMsg = if ([string]::IsNullOrWhiteSpace($r.ErrorMsg)) { "Unknown Network Error" } else { $r.ErrorMsg }
-                        Write-Host "FAILED: $($r.Url) -- $safeErrorMsg"
-
-                        Write-LogCsvRow -Url $r.Url -Status "FAILED" `
-                            -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                            -Written 0 -ErrorMsg $safeErrorMsg
-
-                        Write-FailedUrlRow -Url $r.Url -ErrorMsg $safeErrorMsg
-                    }
-
-                    if ($r.Status -eq "OK" -and $ProgressFile -and $completedSourceSet) {
-                        Add-CompletedProgress `
-                            -Path $ProgressFile `
-                            -Url $r.Url `
-                            -CompletedSet $completedSourceSet `
-                            -KeepFragments ([bool]$KeepFragments)
-                    }
-                    }
-                    catch {
-                        if (Test-IsCancellationException $_) { throw }
-                        if (Test-IsFatalProcessingError $_) { throw }
-
-                        $totalFailed++
-                        $safeErrMsg = $_.Exception.Message
-                        Write-Host "  ERROR processing result for $($r.Url): $safeErrMsg"
-
-                        Write-LogCsvRow -Url $r.Url -Status "FAILED" `
-                            -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                            -Written 0 -ErrorMsg $safeErrMsg
-
-                        Write-FailedUrlRow -Url $r.Url -ErrorMsg $safeErrMsg
-                    }
-                }
-'@
-                . ([scriptblock]::Create($parallelCode))
+        if ($urls.Count -gt 0 -and $ThrottleLimit -gt 1) {
+            $fileQueue = [System.Collections.Generic.Queue[object]]::new()
+            foreach ($url in $urls) {
+                $fileQueue.Enqueue([pscustomobject]@{ Url = $url; Depth = 0 })
             }
-            else {
-                # ---------------------------------------------------------------
-                # Sequential mode (default)
-                # ---------------------------------------------------------------
-                $index = 0
-                foreach ($url in $urls) {
-                    $index++
-                    $markProgressForUrl = $false
-                    Write-Host "[$index / $($urls.Count)] Fetching: $url"
 
-                    try {
-                        $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
-                            -PageUrl $url `
-                            -MaxRetries $RetryCount `
-                            -WaitSec $WaitSeconds `
-                            -TimeoutSec $TimeoutSeconds `
-                            -DoSecondFetch ([bool]$SecondFetch) `
-                            -SecondWaitSec $SecondFetchWait `
-                            -UserAgentString $UserAgent `
-                            -ProxyUrl $Proxy `
-                            -MaxRedirectsCount $Script:MaxRedirects `
-                            -MaxRetryAfterSecondsValue $Script:MaxRetryAfterSeconds `
-                            -EnforceRobotsTxt ([bool]$EnforceRobotsTxt) `
-                            -RobotsUserAgentValue $RobotsUserAgent `
-                            -MaxPageContentBytesValue $Script:MaxPageContentBytes `
-                            -MaxPageContentMBValue $Script:MaxPageContentMB)
-                        $totalExtracted += $links.Count
-                        Write-Host "  Extracted $($links.Count) link(s)."
+            Invoke-ParallelEngine -Queue $fileQueue -Workers $ThrottleLimit -OnResult {
+                param($workerResult)
+                Complete-FileResult -Result $workerResult
+            }
+        }
+        elseif ($urls.Count -gt 0) {
+            $index = 0
+            foreach ($url in $urls) {
+                if (Test-RunDeadlineReached) { break }
 
-                        $stats = Write-MatchedLinks -Links $links -RegexList $searchRegexList `
-                                    -SearchMode $SearchMode `
-                                    -ExcludeRegexList $excludeRegexList -ExcludeMode $ExcludeMode `
-                                    -OutFile $OutputFile -WrittenSet $writtenSet `
-                                    -BlacklistSet $blacklistSet `
-                                    -BlacklistScope $BlacklistScope `
-                                    -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
-                        $totalMatched        += $stats.Matched
-                        $totalExcluded       += $stats.Excluded
-                        $totalBlacklistOut   += $stats.Blacklisted
-                        $totalDupes          += $stats.Duplicates
-                        $totalWritten        += $stats.Written
+                $index++
+                $markProgressForUrl = $false
+                Write-Host "[$index / $($urls.Count)] Fetching: $url"
 
-                        Write-Host "  Matched: $($stats.Matched) | Excluded: $($stats.Excluded) | Blacklisted: $($stats.Blacklisted) | Duplicates: $($stats.Duplicates) | Written: $($stats.Written)"
+                try {
+                    $links = @(Invoke-GetLinksFromWebPageWithWatchdog `
+                        -PageUrl $url `
+                        -MaxRetries $RetryCount `
+                        -WaitSec $WaitSeconds `
+                        -TimeoutSec $TimeoutSeconds `
+                        -DoSecondFetch ([bool]$SecondFetch) `
+                        -SecondWaitSec $SecondFetchWait `
+                        -UserAgentString $UserAgent `
+                        -ProxyUrl $Proxy `
+                        -MaxRedirectsCount $Script:MaxRedirects `
+                        -MaxRetryAfterSecondsValue $Script:MaxRetryAfterSeconds `
+                        -EnforceRobotsTxt ([bool]$EnforceRobotsTxt) `
+                        -RobotsUserAgentValue $RobotsUserAgent `
+                        -MaxPageContentBytesValue $Script:MaxPageContentBytes `
+                        -MaxPageContentMBValue $Script:MaxPageContentMB)
+                    $totalExtracted += $links.Count
+                    Write-Detail "  Extracted $($links.Count) link(s)."
 
-                        Write-LogCsvRow -Url $url -Status "OK" `
-                            -Extracted $links.Count -Matched $stats.Matched `
-                            -Excluded $stats.Excluded -Blacklisted $stats.Blacklisted -Duplicates $stats.Duplicates `
-                            -Written $stats.Written -ErrorMsg ""
+                    $stats = Write-MatchedLinks -Links $links -RegexList $searchRegexList `
+                                -SearchMode $SearchMode `
+                                -ExcludeRegexList $excludeRegexList -ExcludeMode $ExcludeMode `
+                                -OutFile $OutputFile -WrittenSet $writtenSet `
+                                -BlacklistSet $blacklistSet `
+                                -BlacklistScope $BlacklistScope `
+                                -KeepDuplicates ([bool]$KeepDuplicates) -NoDuplicates ([bool]$NoDuplicates) -KeepFragments ([bool]$KeepFragments) -UseEvaluationValue ([bool]$StripRegexBeforeEvaluation)
+                    $totalMatched        += $stats.Matched
+                    $totalExcluded       += $stats.Excluded
+                    $totalBlacklistOut   += $stats.Blacklisted
+                    $totalDupes          += $stats.Duplicates
+                    $totalWritten        += $stats.Written
 
-                        $markProgressForUrl = $true
+                    Write-Host "  Matched: $($stats.Matched) | Excluded: $($stats.Excluded) | Blacklisted: $($stats.Blacklisted) | Duplicates: $($stats.Duplicates) | Written: $($stats.Written)"
+
+                    Write-LogCsvRow -Url $url -Status "OK" `
+                        -Extracted $links.Count -Matched $stats.Matched `
+                        -Excluded $stats.Excluded -Blacklisted $stats.Blacklisted -Duplicates $stats.Duplicates `
+                        -Written $stats.Written -ErrorMsg ""
+
+                    $markProgressForUrl = $true
+                }
+                catch {
+                    if (Test-IsCancellationException $_) { throw }
+                    if (Test-IsFatalProcessingError $_) { throw }
+
+                    $errorMessage = $_.Exception.Message
+
+                    if (Test-IsRobotsTxtBlockedError $_) {
+                        $totalRobotsBlocked++
+                        Write-Host "  ROBOTS: $errorMessage"
+                        Write-Host "  Skipping this URL and continuing."
+
+                        Write-LogCsvRow -Url $url -Status "ROBOTS_BLOCKED" `
+                            -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                            -Written 0 -ErrorMsg $errorMessage
                     }
-                    catch {
-                        if (Test-IsCancellationException $_) { throw }
-                        if (Test-IsFatalProcessingError $_) { throw }
-
-                        $errorMessage = $_.Exception.Message
-
-                        if (Test-IsRobotsTxtBlockedError $_) {
-                            $totalRobotsBlocked++
-                            Write-Host "  ROBOTS: $errorMessage"
-                            Write-Host "  Skipping this URL and continuing."
-
-                            Write-LogCsvRow -Url $url -Status "ROBOTS_BLOCKED" `
-                                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                                -Written 0 -ErrorMsg $errorMessage
+                    else {
+                        $totalFailed++
+                        if (Test-IsRobotsTxtUnavailableError $_) {
+                            Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
+                            $logStatus = "ROBOTS_UNAVAILABLE"
                         }
                         else {
-                            $totalFailed++
-                            if (Test-IsRobotsTxtUnavailableError $_) {
-                                Write-Host "  ROBOTS UNAVAILABLE: $errorMessage"
-                                $logStatus = "ROBOTS_UNAVAILABLE"
-                            }
-                            else {
-                                Write-Host "  FAILED: $errorMessage"
-                                $logStatus = "FAILED"
-                            }
-                            Write-Host "  Skipping this URL and continuing."
-
-                            Write-LogCsvRow -Url $url -Status $logStatus `
-                                -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
-                                -Written 0 -ErrorMsg $errorMessage
-
-                            Write-FailedUrlRow -Url $url -ErrorMsg $errorMessage
+                            Write-Host "  FAILED: $errorMessage"
+                            $logStatus = "FAILED"
                         }
-                    }
+                        Write-Host "  Skipping this URL and continuing."
 
-                    if ($markProgressForUrl -and $ProgressFile -and $completedSourceSet) {
-                        Add-CompletedProgress `
-                            -Path $ProgressFile `
-                            -Url $url `
-                            -CompletedSet $completedSourceSet `
-                            -KeepFragments ([bool]$KeepFragments)
-                    }
+                        Write-LogCsvRow -Url $url -Status $logStatus `
+                            -Extracted 0 -Matched 0 -Excluded 0 -Blacklisted 0 -Duplicates 0 `
+                            -Written 0 -ErrorMsg $errorMessage
 
-                    # Pause between URLs to be polite to servers
-                    if ($index -lt $urls.Count -and $DelaySeconds -gt 0) {
-                        Write-Host "  Waiting $DelaySeconds second(s) before next URL ..."
-                        Start-Sleep -Seconds $DelaySeconds
+                        Write-FailedUrlRow -Url $url -ErrorMsg $errorMessage
                     }
-
-                    Write-Host ""
                 }
+
+                if ($markProgressForUrl -and $ProgressFile -and $completedSourceSet) {
+                    Add-CompletedProgress `
+                        -Path $ProgressFile `
+                        -Url $url `
+                        -CompletedSet $completedSourceSet `
+                        -KeepFragments ([bool]$KeepFragments)
+                }
+
+                # Pause between URLs to be polite to servers
+                if ($index -lt $urls.Count -and ($DelaySeconds -gt 0 -or $Script:DelayJitterSecondsValue -gt 0)) {
+                    Start-InterUrlDelay -BaseSeconds $DelaySeconds
+                }
+
+                Write-Host ""
             }
         }
     }
@@ -7636,7 +8525,10 @@ try {
     # Clean up progress file only after a fully successful completed run.
     # If any URL failed, keep the progress file so -Resume can retry only the unfinished/failed URLs.
     if (($Script:CrawlEnabled -or ($SourceType -eq "File" -and (-not $Script:CrawlEnabled))) -and $ProgressFile -and (Test-Path -LiteralPath $ProgressFile)) {
-        if ($totalFailed -eq 0) {
+        if ($Script:RunDeadlineHit) {
+            Write-Host "Progress file kept because the -MaxRunMinutes limit stopped the run. Re-run with -Resume to continue."
+        }
+        elseif ($totalFailed -eq 0) {
             Remove-ProgressFileIfSafe `
                 -Path $ProgressFile `
                 -Reason "Run completed normally."
@@ -7674,8 +8566,14 @@ try {
     Write-Host "Total duplicates:            $totalDupes"
     Write-Host "Total written to file:       $totalWritten"
     Write-Host "Total failed URLs:           $totalFailed"
+    if ($ThrottleLimit -gt 1) {
+        Write-Host "Parallel workers:            $ThrottleLimit"
+    }
+    if ($Script:RunDeadlineHit) {
+        Write-Host "Stopped by -MaxRunMinutes:   yes ($MaxRunMinutes minute(s))"
+    }
     Write-Host "robots.txt enforced:         $EnforceRobotsTxt"
-    Write-Host "Evaluation regex stripping:  $($Script:StripRegexBeforeEvaluation)"
+    Write-Host "Evaluation regex stripping:  $($Script:StripRegexBeforeEvaluationEnabled)"
     if ($Script:CrawlEnabled) {
         Write-Host "Crawl follow depth:          $($Script:FollowDepthDisplay)"
         Write-Host "Crawl scope:                 $FollowScope"
@@ -7706,7 +8604,7 @@ try {
         Write-Host "Retry command: re-run the same command with: -Resume -ProgressFile `"$ProgressFile`""
     }
 
-    if ($RetryFailedOnFinish -and $totalFailed -gt 0) {
+    if ($RetryFailedOnFinish -and $totalFailed -gt 0 -and -not $Script:RunDeadlineHit) {
         [void](Invoke-RetryFailedOnFinishPass `
             -OriginalParameters $PSBoundParameters `
             -ScriptPath $PSCommandPath `
@@ -7716,6 +8614,11 @@ try {
     # In single URL mode, exit with error code if the only URL failed
     if ($SourceType -eq "Url" -and $totalFailed -gt 0) {
         exit 1
+    }
+
+    # Distinct exit code when -MaxRunMinutes stopped the run before the queue was empty
+    if ($Script:RunDeadlineHit) {
+        exit 3
     }
 }
 catch {
