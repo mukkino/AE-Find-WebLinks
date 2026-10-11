@@ -1,6 +1,6 @@
 #requires -Version 5.1
 
-# AE-Find-WebLinks.ps1 - 1.8.0
+# AE-Find-WebLinks.ps1 - 1.8.1
 # Author: Fabio Lichinchi (mukka)
 # Site: alterego.cc
 # 
