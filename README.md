@@ -54,6 +54,8 @@ It is a raw-response extraction and crawling tool, not a browser. It does **not*
 
 **Parallel processing is available for both URL-file processing and crawling on PowerShell 7+.** Crawling is disabled by default (`-FollowDepth 0`); enable it with a positive depth or `-FollowUntilExhausted`. Crawl mode is no longer limited to sequential processing.
 
+The release's built-in help records validation on **Windows x64, FullLanguage**, using PowerShell **7.6.6 Core** and Windows PowerShell **5.1.26100.9444 Desktop**. Other PowerShell 7 versions, Linux, macOS, ARM and x86 are not validated by this release. Enterprise proxies, PAC configurations and TLS interception require deployment-specific validation.
+
 ---
 
 ## Main capabilities
@@ -144,16 +146,16 @@ In particular, use **`-FollowSubdomains:$true`**, not a bare `-FollowSubdomains`
 
 Search patterns use case-insensitive wildcard matching. Use `*` to match any sequence of characters and `?` to match one character. Patterns match the whole URL, so surround a substring with `*`, such as `'*download*'`. Use `'*'` to save all eligible extracted links.
 
-| Parameter | Purpose | Default |
-| --- | --- | --- |
-| `-SearchPattern` | One include pattern. | Required unless multiple patterns are supplied. |
-| `-SearchPatterns` | An array of include patterns. | None. |
-| `-SearchMode Any` | Accept a link matching at least one include pattern. | `Any`. |
-| `-SearchMode All` | Require every include pattern to match. | Opt-in. |
-| `-ExcludePattern` | One rejection pattern. | None. |
-| `-ExcludePatterns` | An array of rejection patterns. | None. |
-| `-ExcludeMode Any` | Reject a link matching any exclusion. | `Any`. |
-| `-ExcludeMode All` | Reject only when every exclusion matches. | Opt-in. |
+| Parameter          | Purpose                                              | Default                                         |
+| ------------------ | ---------------------------------------------------- | ----------------------------------------------- |
+| `-SearchPattern`   | One include pattern.                                 | Required unless multiple patterns are supplied. |
+| `-SearchPatterns`  | An array of include patterns.                        | None.                                           |
+| `-SearchMode Any`  | Accept a link matching at least one include pattern. | `Any`.                                          |
+| `-SearchMode All`  | Require every include pattern to match.              | Opt-in.                                         |
+| `-ExcludePattern`  | One rejection pattern.                               | None.                                           |
+| `-ExcludePatterns` | An array of rejection patterns.                      | None.                                           |
+| `-ExcludeMode Any` | Reject a link matching any exclusion.                | `Any`.                                          |
+| `-ExcludeMode All` | Reject only when every exclusion matches.            | Opt-in.                                         |
 
 Save ZIP or LHA links while excluding preview and thumbnail URLs:
 
@@ -173,14 +175,14 @@ Include and exclusion patterns control **saved output**, not crawl discovery. Ex
 
 By default, output is appended, duplicate output links are suppressed, and fragments such as `#section` are removed from written links and ignored for uniqueness.
 
-| Option | Behaviour |
-| --- | --- |
-| `-Mode Append` | Preserve existing output and add new matches; default. |
-| `-Mode New` | Create or overwrite the output file. |
-| `-NoDuplicates:$true` | Suppress links already in the output or written during the run; default. |
-| `-NoDuplicates:$false` | Allow repeated output across sources. |
-| `-KeepDuplicates` | Retain genuine repeated occurrences on the same page. |
-| `-KeepFragments` | Preserve fragments in output and uniqueness comparisons. |
+| Option                 | Behaviour                                                    |
+| ---------------------- | ------------------------------------------------------------ |
+| `-Mode Append`         | Preserve existing output and add new matches; default.       |
+| `-Mode New`            | Create or overwrite the output file.                         |
+| `-NoDuplicates:$true`  | Suppress links already in the output or written during the run; default. |
+| `-NoDuplicates:$false` | Allow repeated output across sources.                        |
+| `-KeepDuplicates`      | Retain genuine repeated occurrences on the same page.        |
+| `-KeepFragments`       | Preserve fragments in output and uniqueness comparisons.     |
 
 To preserve repeated occurrences both within pages and across sources, combine `-KeepDuplicates -NoDuplicates:$false`.
 
@@ -196,11 +198,11 @@ Supply one or more text files containing exact URLs, one per line:
 -BlacklistFile '.\already-downloaded.txt','.\blocked-urls.txt' -BlacklistScope Both
 ```
 
-| Scope | Effect |
-| --- | --- |
-| `Input` | Skip blacklisted source URLs and blacklist-filtered crawl candidates. |
-| `Output` | Suppress blacklisted extracted links from saved results. |
-| `Both` | Apply both behaviours; default. |
+| Scope    | Effect                                                       |
+| -------- | ------------------------------------------------------------ |
+| `Input`  | Skip blacklisted source URLs and blacklist-filtered crawl candidates. |
+| `Output` | Suppress blacklisted extracted links from saved results.     |
+| `Both`   | Apply both behaviours; default.                              |
 
 **Blacklists are URL lists, not domain-blocking or wildcard lists.** An entry for `https://example.com/` does not block `https://example.com/article/`. Comparisons use the normalised URL keys described above, including fragment handling. Missing blacklist files produce a warning and are skipped.
 
@@ -233,12 +235,12 @@ The crawler may still follow pages that do not contain `news` or `story` in the 
 
 Use `-FollowDepth` to decide how far links should be followed.
 
-|     **Option**    |                                          **Behaviour**                                         |
-| :---------------: | :--------------------------------------------------------------------------------------------: |
-|  `-FollowDepth 0` |        Default behaviour. No crawling. Only the supplied source URL or URLs are scanned.       |
-|  `-FollowDepth 1` |                   Scan the source page, then fetch links found on that page.                   |
-|  `-FollowDepth 2` | Scan the source page, fetch links found on that page, then fetch links found one level deeper. |
-| `-FollowDepth -1` |                       Crawl until there are no more allowed unseen links.                      |
+|    **Option**     |                        **Behaviour**                         |
+| :---------------: | :----------------------------------------------------------: |
+| `-FollowDepth 0`  | Default behaviour. No crawling. Only the supplied source URL or URLs are scanned. |
+| `-FollowDepth 1`  |  Scan the source page, then fetch links found on that page.  |
+| `-FollowDepth 2`  | Scan the source page, fetch links found on that page, then fetch links found one level deeper. |
+| `-FollowDepth -1` |     Crawl until there are no more allowed unseen links.      |
 
 The clearer equivalent to `-FollowDepth -1` is:
 
@@ -542,9 +544,9 @@ Workers download and extract links. Matching, deduplication, output writing, log
 
 Both URL-file jobs and crawls support saved progress.
 
-| Job type | Default progress path | Recorded state |
-| --- | --- | --- |
-| File mode without crawling | `<OutputFile>.progress` | Completed source URLs and run signature. |
+| Job type                       | Default progress path         | Recorded state                                               |
+| ------------------------------ | ----------------------------- | ------------------------------------------------------------ |
+| File mode without crawling     | `<OutputFile>.progress`       | Completed source URLs and run signature.                     |
 | Crawl mode, from a URL or file | `<OutputFile>.crawl.progress` | Scheduled (`ENQUEUED`) and completed (`DONE`) URLs, plus run signature. |
 
 Use `-ProgressFile` to choose a different path. A normal single-page extraction without crawling does not provide the same resumable queue workflow.
@@ -583,14 +585,14 @@ Aliases: `-AutoRetryFailed`, `-RetryFailedAtEnd`.
 
 These controls address different parts of processing:
 
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `-TimeoutSeconds` | `120` | Request-attempt deadline covering response headers and body reading. |
-| `-RetryCount` | `3` | Maximum attempts per request retry loop, including the first; also bounds watchdog runs. |
-| `-WaitSeconds` | `30` | Configured wait between retry attempts. |
-| `-StuckUrlTimeoutSeconds` | `300` | Restart processing of a URL when its watchdog expires. |
-| `-MaxRetryAfterSeconds` | `300` | Cap for honoured server `Retry-After` waits. |
-| `-MaxRedirects` | `10` | Limit for redirect handling, including HTTP and meta-refresh handling. |
+| Parameter                 | Default | Purpose                                                      |
+| ------------------------- | ------- | ------------------------------------------------------------ |
+| `-TimeoutSeconds`         | `120`   | Request-attempt deadline covering response headers and body reading. |
+| `-RetryCount`             | `3`     | Maximum attempts per request retry loop, including the first; also bounds watchdog runs. |
+| `-WaitSeconds`            | `30`    | Configured wait between retry attempts.                      |
+| `-StuckUrlTimeoutSeconds` | `300`   | Restart processing of a URL when its watchdog expires.       |
+| `-MaxRetryAfterSeconds`   | `300`   | Cap for honoured server `Retry-After` waits.                 |
+| `-MaxRedirects`           | `10`    | Limit for redirect handling, including HTTP and meta-refresh handling. |
 
 The watchdog covers the wider URL-processing workflow, including supported waits and extraction checkpoints. It is separate from the timeout on an individual HTTP attempt. Watchdog restarts are bounded by the retry configuration; these are recovery mechanisms, not a guarantee that an unavailable URL will succeed.
 
@@ -675,18 +677,18 @@ The script uses temporary files and replacement retries for maintenance, with cl
 
 Most runs should keep the defaults. These additional parameters expose resource and file-operation controls:
 
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `-MaxPageContentMB` | `50` | Response-content size limit. |
-| `-RegexTimeoutSeconds` | `10` | Regex operation timeout. |
-| `-MaxUrlLength` | `8192` | URL-length limit used during normalisation and comparison. |
-| `-MaintenanceLargeFileLimitMB` | `1024` | Large-file maintenance guard. |
-| `-FileWriteRetryCount` | `5` | File-write retry attempts. |
-| `-FileWriteRetryDelayMinMs` | `50` | Minimum write-retry delay. |
-| `-FileWriteRetryDelayMaxMs` | `300` | Maximum write-retry delay. |
-| `-FileMoveRetryCount` | `5` | File-replacement retry attempts. |
-| `-FileMoveRetryDelayMs` | `300` | File-replacement retry delay. |
-| `-ConnectionLimit` | `100` | Windows PowerShell 5.1 transport connection limit. |
+| Parameter                      | Default | Purpose                                                    |
+| ------------------------------ | ------- | ---------------------------------------------------------- |
+| `-MaxPageContentMB`            | `50`    | Response-content size limit.                               |
+| `-RegexTimeoutSeconds`         | `10`    | Regex operation timeout.                                   |
+| `-MaxUrlLength`                | `8192`  | URL-length limit used during normalisation and comparison. |
+| `-MaintenanceLargeFileLimitMB` | `1024`  | Large-file maintenance guard.                              |
+| `-FileWriteRetryCount`         | `5`     | File-write retry attempts.                                 |
+| `-FileWriteRetryDelayMinMs`    | `50`    | Minimum write-retry delay.                                 |
+| `-FileWriteRetryDelayMaxMs`    | `300`   | Maximum write-retry delay.                                 |
+| `-FileMoveRetryCount`          | `5`     | File-replacement retry attempts.                           |
+| `-FileMoveRetryDelayMs`        | `300`   | File-replacement retry delay.                              |
+| `-ConnectionLimit`             | `100`   | Windows PowerShell 5.1 transport connection limit.         |
 
 `-AllowExtremeOperationalValues` bypasses the script's additional typo guardrails for intentional extreme settings; it does not remove parameter type and range validation. It is normally unnecessary. The built-in help contains the full parameter reference.
 
@@ -756,12 +758,12 @@ To continue the saved job, rerun with the same inputs/settings and add `-Resume`
 
 ## Exit codes and completion checks
 
-| Code | Meaning |
-| --- | --- |
-| `0` | Normal command completion; can also occur after native-host Ctrl+C. It does not guarantee that every URL in a File run succeeded. |
-| `1` | Runtime failure or URL failure in the applicable execution path. |
-| `2` | Incomplete extraction command. |
-| `3` | Runtime scheduling limit reached, with progress retained where enabled. |
+| Code  | Meaning                                                      |
+| ----- | ------------------------------------------------------------ |
+| `0`   | Normal command completion; can also occur after native-host Ctrl+C. It does not guarantee that every URL in a File run succeeded. |
+| `1`   | Runtime failure or URL failure in the applicable execution path. |
+| `2`   | Incomplete extraction command.                               |
+| `3`   | Runtime scheduling limit reached, with progress retained where enabled. |
 | `130` | The script's cancellation handler ran. Native-host interruption can behave differently. |
 
 For automated jobs, check the CSV statuses, failure records, totals and progress alongside the exit code. In the current code, File-mode per-URL failures do not always force a nonzero exit, and a URL-source failure can take precedence over a deadline status. Avoid treating one exit code as a complete run report.
@@ -784,82 +786,82 @@ Each example is an independent alternative, not a sequence to run against the sa
 
 ### Parameter index
 
-| Parameter | Default |
-| --- | --- |
-| [`-Source`](#parameter-source) | `not set` |
-| [`-SearchPattern`](#parameter-searchpattern) | `not set` |
-| [`-SearchPatterns`](#parameter-searchpatterns) | `not set` |
-| [`-SearchMode`](#parameter-searchmode) | `"Any"` |
-| [`-ExcludePattern`](#parameter-excludepattern) | `not set` |
-| [`-ExcludePatterns`](#parameter-excludepatterns) | `not set` |
-| [`-ExcludeMode`](#parameter-excludemode) | `"Any"` |
-| [`-OutputFile`](#parameter-outputfile) | `not set` |
-| [`-Mode`](#parameter-mode) | `"Append"` |
-| [`-SourceType`](#parameter-sourcetype) | `"Url"` |
-| [`-RetryCount`](#parameter-retrycount) | `3` |
-| [`-WaitSeconds`](#parameter-waitseconds) | `30` |
-| [`-TimeoutSeconds`](#parameter-timeoutseconds) | `120` |
-| [`-StuckUrlTimeoutSeconds`](#parameter-stuckurltimeoutseconds) | `"300"` |
-| [`-DelaySeconds`](#parameter-delayseconds) | `5` |
-| [`-FollowDepth`](#parameter-followdepth) | `0` |
-| [`-FollowUntilExhausted`](#parameter-followuntilexhausted) | `off` |
-| [`-FollowScope`](#parameter-followscope) | `"SameDomain"` |
-| [`-FollowPathScope`](#parameter-followpathscope) | `"Any"` |
-| [`-FollowSubdomains`](#parameter-followsubdomains) | `$false` |
-| [`-MaxSubdomainDepth`](#parameter-maxsubdomaindepth) | `1` |
-| [`-MaxFollowPages`](#parameter-maxfollowpages) | `1000` |
-| [`-EnforceRobotsTxt`](#parameter-enforcerobotstxt) | `off` |
-| [`-RobotsUserAgent`](#parameter-robotsuseragent) | `"AE-Find-WebLinks"` |
-| [`-SecondFetch`](#parameter-secondfetch) | `$true` |
-| [`-SecondFetchWait`](#parameter-secondfetchwait) | `5` |
-| [`-KeepDuplicates`](#parameter-keepduplicates) | `off` |
-| [`-NoDuplicates`](#parameter-noduplicates) | `$true` |
-| [`-BlacklistFile`](#parameter-blacklistfile) | `not set` |
-| [`-BlacklistScope`](#parameter-blacklistscope) | `"Both"` |
-| [`-ThrottleLimit`](#parameter-throttlelimit) | `1` |
-| [`-Resume`](#parameter-resume) | `off` |
-| [`-DeduplicateFiles`](#parameter-deduplicatefiles) | `off` |
-| [`-KeepFragments`](#parameter-keepfragments) | `off` |
-| [`-StripRegexBeforeEvaluation`](#parameter-stripregexbeforeevaluation) | `off` |
-| [`-LinkEvaluationStripRegex`](#parameter-linkevaluationstripregex) | `not set` |
-| [`-Proxy`](#parameter-proxy) | `not set` |
-| [`-SortOutput`](#parameter-sortoutput) | `$false` |
-| [`-Command`](#parameter-command) | `"Run"` |
-| [`-Files`](#parameter-files) | `not set` |
-| [`-SortDirection`](#parameter-sortdirection) | `"Ascending"` |
-| [`-DeduplicateWhen`](#parameter-deduplicatewhen) | `"None"` |
-| [`-SortWhen`](#parameter-sortwhen) | `"None"` |
-| [`-UserAgent`](#parameter-useragent) | `browser-style string; see entry` |
-| [`-ProgressFile`](#parameter-progressfile) | `not set` |
-| [`-LogCsv`](#parameter-logcsv) | `not set` |
-| [`-FailedUrlFile`](#parameter-failedurlfile) | `not set` |
-| [`-LogMode`](#parameter-logmode) | `"Append"` |
-| [`-FailedUrlMode`](#parameter-failedurlmode) | `"Append"` |
-| [`-RetryFailedOnFinish`](#parameter-retryfailedonfinish) | `off` |
-| [`-MaintenanceLargeFileLimitMB`](#parameter-maintenancelargefilelimitmb) | `1024` |
-| [`-IgnoreMaintenanceLargeFileLimit`](#parameter-ignoremaintenancelargefilelimit) | `off` |
-| [`-MaxPageContentMB`](#parameter-maxpagecontentmb) | `50` |
-| [`-RegexTimeoutSeconds`](#parameter-regextimeoutseconds) | `10` |
-| [`-MaxUrlLength`](#parameter-maxurllength) | `8192` |
-| [`-MaxRedirects`](#parameter-maxredirects) | `10` |
-| [`-MaxRetryAfterSeconds`](#parameter-maxretryafterseconds) | `300` |
-| [`-FileWriteRetryCount`](#parameter-filewriteretrycount) | `5` |
-| [`-FileWriteRetryDelayMinMs`](#parameter-filewriteretrydelayminms) | `50` |
-| [`-FileWriteRetryDelayMaxMs`](#parameter-filewriteretrydelaymaxms) | `300` |
-| [`-FileMoveRetryCount`](#parameter-filemoveretrycount) | `5` |
-| [`-FileMoveRetryDelayMs`](#parameter-filemoveretrydelayms) | `300` |
-| [`-ConnectionLimit`](#parameter-connectionlimit) | `100` |
-| [`-AllowExtremeOperationalValues`](#parameter-allowextremeoperationalvalues) | `off` |
-| [`-HighFailureRatePercent`](#parameter-highfailureratepercent) | `50` |
-| [`-Header`](#parameter-header) | `not set` |
-| [`-SkipCertificateCheck`](#parameter-skipcertificatecheck) | `off` |
-| [`-DefaultScheme`](#parameter-defaultscheme) | `"https"` |
-| [`-Quiet`](#parameter-quiet) | `off` |
-| [`-MaxRunMinutes`](#parameter-maxrunminutes) | `0` |
-| [`-DelayJitterSeconds`](#parameter-delayjitterseconds) | `0` |
-| [`-Help`](#parameter-help) | `off` |
-| [`-InteractiveHelp`](#parameter-interactivehelp) | `off` |
-| [`-Version`](#parameter-version) | `off` |
+| Parameter                                                    | Default                           |
+| ------------------------------------------------------------ | --------------------------------- |
+| [`-Source`](#parameter-source)                               | `not set`                         |
+| [`-SearchPattern`](#parameter-searchpattern)                 | `not set`                         |
+| [`-SearchPatterns`](#parameter-searchpatterns)               | `not set`                         |
+| [`-SearchMode`](#parameter-searchmode)                       | `"Any"`                           |
+| [`-ExcludePattern`](#parameter-excludepattern)               | `not set`                         |
+| [`-ExcludePatterns`](#parameter-excludepatterns)             | `not set`                         |
+| [`-ExcludeMode`](#parameter-excludemode)                     | `"Any"`                           |
+| [`-OutputFile`](#parameter-outputfile)                       | `not set`                         |
+| [`-Mode`](#parameter-mode)                                   | `"Append"`                        |
+| [`-SourceType`](#parameter-sourcetype)                       | `"Url"`                           |
+| [`-RetryCount`](#parameter-retrycount)                       | `3`                               |
+| [`-WaitSeconds`](#parameter-waitseconds)                     | `30`                              |
+| [`-TimeoutSeconds`](#parameter-timeoutseconds)               | `120`                             |
+| [`-StuckUrlTimeoutSeconds`](#parameter-stuckurltimeoutseconds) | `"300"`                           |
+| [`-DelaySeconds`](#parameter-delayseconds)                   | `5`                               |
+| [`-FollowDepth`](#parameter-followdepth)                     | `0`                               |
+| [`-FollowUntilExhausted`](#parameter-followuntilexhausted)   | `off`                             |
+| [`-FollowScope`](#parameter-followscope)                     | `"SameDomain"`                    |
+| [`-FollowPathScope`](#parameter-followpathscope)             | `"Any"`                           |
+| [`-FollowSubdomains`](#parameter-followsubdomains)           | `$false`                          |
+| [`-MaxSubdomainDepth`](#parameter-maxsubdomaindepth)         | `1`                               |
+| [`-MaxFollowPages`](#parameter-maxfollowpages)               | `1000`                            |
+| [`-EnforceRobotsTxt`](#parameter-enforcerobotstxt)           | `off`                             |
+| [`-RobotsUserAgent`](#parameter-robotsuseragent)             | `"AE-Find-WebLinks"`              |
+| [`-SecondFetch`](#parameter-secondfetch)                     | `$true`                           |
+| [`-SecondFetchWait`](#parameter-secondfetchwait)             | `5`                               |
+| [`-KeepDuplicates`](#parameter-keepduplicates)               | `off`                             |
+| [`-NoDuplicates`](#parameter-noduplicates)                   | `$true`                           |
+| [`-BlacklistFile`](#parameter-blacklistfile)                 | `not set`                         |
+| [`-BlacklistScope`](#parameter-blacklistscope)               | `"Both"`                          |
+| [`-ThrottleLimit`](#parameter-throttlelimit)                 | `1`                               |
+| [`-Resume`](#parameter-resume)                               | `off`                             |
+| [`-DeduplicateFiles`](#parameter-deduplicatefiles)           | `off`                             |
+| [`-KeepFragments`](#parameter-keepfragments)                 | `off`                             |
+| [`-StripRegexBeforeEvaluation`](#parameter-stripregexbeforeevaluation) | `off`                             |
+| [`-LinkEvaluationStripRegex`](#parameter-linkevaluationstripregex) | `not set`                         |
+| [`-Proxy`](#parameter-proxy)                                 | `not set`                         |
+| [`-SortOutput`](#parameter-sortoutput)                       | `$false`                          |
+| [`-Command`](#parameter-command)                             | `"Run"`                           |
+| [`-Files`](#parameter-files)                                 | `not set`                         |
+| [`-SortDirection`](#parameter-sortdirection)                 | `"Ascending"`                     |
+| [`-DeduplicateWhen`](#parameter-deduplicatewhen)             | `"None"`                          |
+| [`-SortWhen`](#parameter-sortwhen)                           | `"None"`                          |
+| [`-UserAgent`](#parameter-useragent)                         | `browser-style string; see entry` |
+| [`-ProgressFile`](#parameter-progressfile)                   | `not set`                         |
+| [`-LogCsv`](#parameter-logcsv)                               | `not set`                         |
+| [`-FailedUrlFile`](#parameter-failedurlfile)                 | `not set`                         |
+| [`-LogMode`](#parameter-logmode)                             | `"Append"`                        |
+| [`-FailedUrlMode`](#parameter-failedurlmode)                 | `"Append"`                        |
+| [`-RetryFailedOnFinish`](#parameter-retryfailedonfinish)     | `off`                             |
+| [`-MaintenanceLargeFileLimitMB`](#parameter-maintenancelargefilelimitmb) | `1024`                            |
+| [`-IgnoreMaintenanceLargeFileLimit`](#parameter-ignoremaintenancelargefilelimit) | `off`                             |
+| [`-MaxPageContentMB`](#parameter-maxpagecontentmb)           | `50`                              |
+| [`-RegexTimeoutSeconds`](#parameter-regextimeoutseconds)     | `10`                              |
+| [`-MaxUrlLength`](#parameter-maxurllength)                   | `8192`                            |
+| [`-MaxRedirects`](#parameter-maxredirects)                   | `10`                              |
+| [`-MaxRetryAfterSeconds`](#parameter-maxretryafterseconds)   | `300`                             |
+| [`-FileWriteRetryCount`](#parameter-filewriteretrycount)     | `5`                               |
+| [`-FileWriteRetryDelayMinMs`](#parameter-filewriteretrydelayminms) | `50`                              |
+| [`-FileWriteRetryDelayMaxMs`](#parameter-filewriteretrydelaymaxms) | `300`                             |
+| [`-FileMoveRetryCount`](#parameter-filemoveretrycount)       | `5`                               |
+| [`-FileMoveRetryDelayMs`](#parameter-filemoveretrydelayms)   | `300`                             |
+| [`-ConnectionLimit`](#parameter-connectionlimit)             | `100`                             |
+| [`-AllowExtremeOperationalValues`](#parameter-allowextremeoperationalvalues) | `off`                             |
+| [`-HighFailureRatePercent`](#parameter-highfailureratepercent) | `50`                              |
+| [`-Header`](#parameter-header)                               | `not set`                         |
+| [`-SkipCertificateCheck`](#parameter-skipcertificatecheck)   | `off`                             |
+| [`-DefaultScheme`](#parameter-defaultscheme)                 | `"https"`                         |
+| [`-Quiet`](#parameter-quiet)                                 | `off`                             |
+| [`-MaxRunMinutes`](#parameter-maxrunminutes)                 | `0`                               |
+| [`-DelayJitterSeconds`](#parameter-delayjitterseconds)       | `0`                               |
+| [`-Help`](#parameter-help)                                   | `off`                             |
+| [`-InteractiveHelp`](#parameter-interactivehelp)             | `off`                             |
+| [`-Version`](#parameter-version)                             | `off`                             |
 
 ### Parameter Source
 
@@ -1989,79 +1991,79 @@ These distinctions matter: some combinations are **rejected**, some are **accept
 
 ### Rejected combinations and missing dependencies
 
-| Combination or condition | Actual behaviour | How to use it correctly |
-| --- | --- | --- |
-| Positive `-FollowDepth` plus `-FollowUntilExhausted` | Error before the run. | Choose bounded depth or unlimited-depth mode. |
-| `-ThrottleLimit` greater than 1 on Windows PowerShell 5.1 | Error. | Use `1` or run under PowerShell 7+. |
-| `-Resume` with `-SourceType Url` and no crawling | Error. | Resume a File job or enable the original crawl mode. |
-| `-StripRegexBeforeEvaluation` without a nonblank regex | Error. | Supply `-LinkEvaluationStripRegex`. |
-| Invalid `-LinkEvaluationStripRegex` | Regex compilation error. | Supply a valid .NET regex; quote it as a string. |
-| `-FileWriteRetryDelayMinMs` greater than `-FileWriteRetryDelayMaxMs` | Error. | Set minimum no higher than maximum. |
-| `-Header 'User-Agent: ...'` | Error. | Use `-UserAgent`. |
-| Malformed header or non-HTTP/HTTPS explicit proxy | Error when validated. | Use `Name: value` headers and an absolute HTTP/HTTPS proxy URI. |
-| Non-Run `-Command` without `-Files` | Error. | Supply the maintenance target file(s). |
-| `-Command Maintain` with both timing settings `None` | Error after legacy-option mapping. | Set `-DeduplicateWhen End`, `-SortWhen End`, or both. |
-| Run without source, output or any nonblank include pattern | Exit `2`. | Supply all three; use `-SearchPattern '*'` to include all links. |
-| Existing File/crawl progress without `-Resume` | Refuses to start a fresh run over it. | Resume, deliberately choose another progress path, or intentionally restart with old state removed. |
-| Resume with an incompatible signature | Refuses the saved state. | Restore original signed settings or start a separate job. |
+| Combination or condition                                     | Actual behaviour                                          | How to use it correctly                                      |
+| ------------------------------------------------------------ | --------------------------------------------------------- | ------------------------------------------------------------ |
+| Positive `-FollowDepth` plus `-FollowUntilExhausted`         | Error before the run.                                     | Choose bounded depth or unlimited-depth mode.                |
+| `-ThrottleLimit` greater than 1 on Windows PowerShell 5.1    | Error.                                                    | Use `1` or run under PowerShell 7+.                          |
+| `-Resume` with `-SourceType Url` and no crawling             | Error.                                                    | Resume a File job or enable the original crawl mode.         |
+| `-StripRegexBeforeEvaluation` without a nonblank regex       | Error.                                                    | Supply `-LinkEvaluationStripRegex`.                          |
+| Invalid `-LinkEvaluationStripRegex`                          | Regex compilation error.                                  | Supply a valid .NET regex; quote it as a string.             |
+| `-FileWriteRetryDelayMinMs` greater than `-FileWriteRetryDelayMaxMs` | Error.                                                    | Set minimum no higher than maximum.                          |
+| `-Header 'User-Agent: ...'`                                  | Error.                                                    | Use `-UserAgent`.                                            |
+| Malformed header or non-HTTP/HTTPS explicit proxy            | Error when validated.                                     | Use `Name: value` headers and an absolute HTTP/HTTPS proxy URI. |
+| Non-Run `-Command` without `-Files`                          | Error.                                                    | Supply the maintenance target file(s).                       |
+| `-Command Maintain` with both timing settings `None`         | Error after legacy-option mapping.                        | Set `-DeduplicateWhen End`, `-SortWhen End`, or both.        |
+| Run without source, output or any nonblank include pattern   | Exit `2`.                                                 | Supply all three; use `-SearchPattern '*'` to include all links. |
+| Existing File/crawl progress without `-Resume`               | Refuses to start a fresh run over it.                     | Resume, deliberately choose another progress path, or intentionally restart with old state removed. |
+| Resume with an incompatible signature                        | Refuses the saved state.                                  | Restore original signed settings or start a separate job.    |
 | Resume with existing state but missing output, or completed state and empty output | Refuses to skip completed work whose results may be lost. | Restore the output or deliberately restart; this can also affect jobs whose completed pages produced no matches. |
-| An operational value over its normal guardrail | Error. | Correct the value, or intentionally add `-AllowExtremeOperationalValues`. |
-| Value outside its declared type/range/set | PowerShell binding/validation error. | Use an accepted value; the extreme-value switch cannot bypass this. |
-| Conflicting operational file paths | Error. | Give source, output, progress, logs and failure records distinct appropriate paths. |
+| An operational value over its normal guardrail               | Error.                                                    | Correct the value, or intentionally add `-AllowExtremeOperationalValues`. |
+| Value outside its declared type/range/set                    | PowerShell binding/validation error.                      | Use an accepted value; the extreme-value switch cannot bypass this. |
+| Conflicting operational file paths                           | Error.                                                    | Give source, output, progress, logs and failure records distinct appropriate paths. |
 
 The collision checks specifically reject output versus source/blacklists, logs/failures versus source/output/blacklists/each other, and progress versus source/output/log/failure/blacklists. Do not use maintenance target selection as a way to share writable operational files between concurrent runs.
 
 ### Automatic overrides and combinations that work
 
-| Combination | Result |
-| --- | --- |
-| `-SearchPattern` plus `-SearchPatterns` | Merges nonblank patterns, removes repeats, applies one SearchMode. |
-| `-ExcludePattern` plus `-ExcludePatterns` | Merges nonblank patterns, removes repeats, applies one ExcludeMode. |
-| `-LinkEvaluationStripRegex` without the enabling switch | Warns and automatically enables stripping, even if the switch was explicitly false. |
-| `-Resume` plus any `New` file mode | Forces output, CSV and failure modes to Append. |
-| `-RetryFailedOnFinish` launching a pass | Enables Resume, forces Append modes, removes its own retry switch. |
-| `-FollowUntilExhausted` plus `-FollowDepth 0` | Crawling is enabled with unlimited hop depth; 0 does not cancel the switch. |
-| Unlimited hop depth plus `-MaxFollowPages 1000` | Still stops scheduling at the page cap. |
-| `-FollowScope Any` plus `-FollowPathScope SeedPath` | Seed paths remain tied to seed hosts; this is not unrestricted external-domain crawling. |
-| `-KeepDuplicates` plus default `-NoDuplicates:$true` | Keeps within-page repeats only while that key is not already present from prior output/pages. |
-| `-KeepDuplicates -NoDuplicates:$false` | Keeps repeats within pages and across pages, unless maintenance subsequently removes them. |
-| `-DeduplicateFiles` plus `-DeduplicateWhen None` | Legacy mapping selects Start deduplication. |
-| `-DeduplicateFiles` plus non-None `-DeduplicateWhen` | Explicit timing wins. |
-| `-SortOutput:$true` plus `-SortWhen None` | Legacy output-only sorting at the end. |
-| Previous combination plus `-DeduplicateFiles` | Also sorts source/output/blacklist files at the start; output is sorted again at the end. |
-| `-SortOutput:$true` plus non-None `-SortWhen` | Explicit sorting phases win; those phases target source/output/blacklist files. |
-| `-IgnoreMaintenanceLargeFileLimit` plus a nonzero maintenance limit | The ignore switch disables that size guard. |
-| `-DelaySeconds 0` plus positive `-DelayJitterSeconds` | Inter-URL waits still include random jitter. |
-| A small watchdog plus long HTTP/retry/second-fetch waits | The watchdog can interrupt/restart the URL before those configured durations finish. |
-| `-Version`, `-Help` and `-InteractiveHelp` together | Version wins; without Version, Help wins over InteractiveHelp. |
+| Combination                                                  | Result                                                       |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+| `-SearchPattern` plus `-SearchPatterns`                      | Merges nonblank patterns, removes repeats, applies one SearchMode. |
+| `-ExcludePattern` plus `-ExcludePatterns`                    | Merges nonblank patterns, removes repeats, applies one ExcludeMode. |
+| `-LinkEvaluationStripRegex` without the enabling switch      | Warns and automatically enables stripping, even if the switch was explicitly false. |
+| `-Resume` plus any `New` file mode                           | Forces output, CSV and failure modes to Append.              |
+| `-RetryFailedOnFinish` launching a pass                      | Enables Resume, forces Append modes, removes its own retry switch. |
+| `-FollowUntilExhausted` plus `-FollowDepth 0`                | Crawling is enabled with unlimited hop depth; 0 does not cancel the switch. |
+| Unlimited hop depth plus `-MaxFollowPages 1000`              | Still stops scheduling at the page cap.                      |
+| `-FollowScope Any` plus `-FollowPathScope SeedPath`          | Seed paths remain tied to seed hosts; this is not unrestricted external-domain crawling. |
+| `-KeepDuplicates` plus default `-NoDuplicates:$true`         | Keeps within-page repeats only while that key is not already present from prior output/pages. |
+| `-KeepDuplicates -NoDuplicates:$false`                       | Keeps repeats within pages and across pages, unless maintenance subsequently removes them. |
+| `-DeduplicateFiles` plus `-DeduplicateWhen None`             | Legacy mapping selects Start deduplication.                  |
+| `-DeduplicateFiles` plus non-None `-DeduplicateWhen`         | Explicit timing wins.                                        |
+| `-SortOutput:$true` plus `-SortWhen None`                    | Legacy output-only sorting at the end.                       |
+| Previous combination plus `-DeduplicateFiles`                | Also sorts source/output/blacklist files at the start; output is sorted again at the end. |
+| `-SortOutput:$true` plus non-None `-SortWhen`                | Explicit sorting phases win; those phases target source/output/blacklist files. |
+| `-IgnoreMaintenanceLargeFileLimit` plus a nonzero maintenance limit | The ignore switch disables that size guard.                  |
+| `-DelaySeconds 0` plus positive `-DelayJitterSeconds`        | Inter-URL waits still include random jitter.                 |
+| A small watchdog plus long HTTP/retry/second-fetch waits     | The watchdog can interrupt/restart the URL before those configured durations finish. |
+| `-Version`, `-Help` and `-InteractiveHelp` together          | Version wins; without Version, Help wins over InteractiveHelp. |
 
 ### Accepted but inactive in the selected mode
 
-| Option | When it has no useful effect |
-| --- | --- |
-| `-FollowScope`, `-FollowSubdomains`, `-MaxSubdomainDepth`, `-MaxFollowPages` | Crawling is disabled. |
-| `-FollowPathScope SeedPath` | Crawling is disabled; emits a warning. |
-| `-FollowSubdomains`, `-MaxSubdomainDepth` | Scope is SameHost or Any; MaxSubdomainDepth also needs FollowSubdomains true to allow extra subdomains. |
-| `-ThrottleLimit` above 1 on PowerShell 7+ | One source URL without crawling; warns and uses sequential processing. |
-| `-SecondFetchWait` | SecondFetch is false. |
-| `-BlacklistScope` | No blacklist entries were loaded. |
-| `-ExcludeMode` | No exclusion patterns were supplied. |
-| `-RobotsUserAgent` | Robots enforcement is off; it still participates in the resume signature. |
-| `-LogMode`, `-FailedUrlMode` | Their respective file paths are absent. |
-| `-Files` | Command Run; warns and ignores this target list. |
-| `-SortDirection` | No sorting operation is enabled. |
+| Option                                                       | When it has no useful effect                                 |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+| `-FollowScope`, `-FollowSubdomains`, `-MaxSubdomainDepth`, `-MaxFollowPages` | Crawling is disabled.                                        |
+| `-FollowPathScope SeedPath`                                  | Crawling is disabled; emits a warning.                       |
+| `-FollowSubdomains`, `-MaxSubdomainDepth`                    | Scope is SameHost or Any; MaxSubdomainDepth also needs FollowSubdomains true to allow extra subdomains. |
+| `-ThrottleLimit` above 1 on PowerShell 7+                    | One source URL without crawling; warns and uses sequential processing. |
+| `-SecondFetchWait`                                           | SecondFetch is false.                                        |
+| `-BlacklistScope`                                            | No blacklist entries were loaded.                            |
+| `-ExcludeMode`                                               | No exclusion patterns were supplied.                         |
+| `-RobotsUserAgent`                                           | Robots enforcement is off; it still participates in the resume signature. |
+| `-LogMode`, `-FailedUrlMode`                                 | Their respective file paths are absent.                      |
+| `-Files`                                                     | Command Run; warns and ignores this target list.             |
+| `-SortDirection`                                             | No sorting operation is enabled.                             |
 | `-DeduplicateWhen`/`-SortWhen` with standalone Deduplicate or Sort | The named command selects the operation directly; use Maintain to select operations through those flags. |
-| HTTP, extraction and crawl settings | Standalone maintenance does not fetch or extract; shared early validations can still reject invalid arguments. |
-| `-ConnectionLimit` | PowerShell 7 uses HttpClient connection management. |
-| `-HighFailureRatePercent` | Crawling or a single non-crawl URL; the warning is implemented for non-crawl File jobs. |
-| `-RetryFailedOnFinish` | No failures, a deadline stop, or no usable script/progress path for the extra pass. Missing prerequisites warn rather than manufacture recovery state. |
+| HTTP, extraction and crawl settings                          | Standalone maintenance does not fetch or extract; shared early validations can still reject invalid arguments. |
+| `-ConnectionLimit`                                           | PowerShell 7 uses HttpClient connection management.          |
+| `-HighFailureRatePercent`                                    | Crawling or a single non-crawl URL; the warning is implemented for non-crawl File jobs. |
+| `-RetryFailedOnFinish`                                       | No failures, a deadline stop, or no usable script/progress path for the extra pass. Missing prerequisites warn rather than manufacture recovery state. |
 
 ### Which settings must match for resume?
 
 The signature is a configuration fingerprint, **not a checksum of every input file's contents**. Preserve the original source and blacklist files as well as their paths if you want a consistent continuation.
 
-| Included in every run signature | Included additionally when crawling |
-| --- | --- |
+| Included in every run signature                              | Included additionally when crawling                          |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
 | SourceType; source value/path; absolute output path; effective include patterns and SearchMode; effective exclusion patterns and ExcludeMode; BlacklistScope and blacklist paths; SecondFetch; EnforceRobotsTxt and RobotsUserAgent; KeepDuplicates, NoDuplicates and KeepFragments; regex-stripping state and regex text. | Crawl-enabled state; unlimited-depth state; FollowDepth; FollowScope; FollowPathScope; FollowSubdomains; MaxSubdomainDepth; MaxFollowPages. |
 
 For File mode, source paths are made absolute. Blacklist paths are made absolute, sorted and deduplicated. Effective search/exclusion pattern order can still affect the signature, so reuse the original command rather than rearranging equivalent filters.
@@ -2072,20 +2074,20 @@ Worker count, ordinary timing settings, watchdog duration, quiet mode, headers, 
 
 ### Zero-value meanings
 
-| Parameter set to 0 | Meaning |
-| --- | --- |
-| FollowDepth | No crawling unless FollowUntilExhausted enables it. |
-| MaxFollowPages | No crawl page cap. |
-| MaxSubdomainDepth | No extra-subdomain depth cap when that policy is active. |
-| StuckUrlTimeoutSeconds | Watchdog disabled. |
-| MaxRunMinutes | No run scheduling deadline. |
-| DelaySeconds, WaitSeconds, SecondFetchWait | No wait for that specific delay category. |
-| DelayJitterSeconds | No random extra inter-URL delay. |
-| MaintenanceLargeFileLimitMB, MaxPageContentMB | Corresponding size guard disabled. |
-| RegexTimeoutSeconds | Infinite regex timeout; warns. |
-| MaxUrlLength | URL-length guard disabled. |
-| MaxRetryAfterSeconds | Ignore Retry-After and use ordinary retry-delay handling; not an unlimited server wait. |
-| HighFailureRatePercent | High-failure warning disabled. |
+| Parameter set to 0                                   | Meaning                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------ |
+| FollowDepth                                          | No crawling unless FollowUntilExhausted enables it.          |
+| MaxFollowPages                                       | No crawl page cap.                                           |
+| MaxSubdomainDepth                                    | No extra-subdomain depth cap when that policy is active.     |
+| StuckUrlTimeoutSeconds                               | Watchdog disabled.                                           |
+| MaxRunMinutes                                        | No run scheduling deadline.                                  |
+| DelaySeconds, WaitSeconds, SecondFetchWait           | No wait for that specific delay category.                    |
+| DelayJitterSeconds                                   | No random extra inter-URL delay.                             |
+| MaintenanceLargeFileLimitMB, MaxPageContentMB        | Corresponding size guard disabled.                           |
+| RegexTimeoutSeconds                                  | Infinite regex timeout; warns.                               |
+| MaxUrlLength                                         | URL-length guard disabled.                                   |
+| MaxRetryAfterSeconds                                 | Ignore Retry-After and use ordinary retry-delay handling; not an unlimited server wait. |
+| HighFailureRatePercent                               | High-failure warning disabled.                               |
 | FileWriteRetryDelayMinMs/MaxMs, FileMoveRetryDelayMs | Zero delay for that bound/operation; minimum must still be no greater than maximum. |
 
 RetryCount, TimeoutSeconds, ThrottleLimit, MaxRedirects, FileWriteRetryCount, FileMoveRetryCount and ConnectionLimit all require at least **1**. Zero is invalid for these options.
@@ -2125,3 +2127,5 @@ Additional boundaries to keep in mind:
 AE-Find-WebLinks is released under [The Unlicense](https://github.com/mukkino/AE-Find-WebLinks/blob/main/LICENSE), with no warranty. It may be used, modified and distributed for personal or commercial purposes under that licence.
 
 For bug reports and feature requests, visit the [project page](https://alterego.cc/wp/ae-find-weblinks/) or the [GitHub repository](https://github.com/mukkino/AE-Find-WebLinks).
+---
+
