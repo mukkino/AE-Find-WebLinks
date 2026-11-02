@@ -2127,5 +2127,6 @@ Additional boundaries to keep in mind:
 AE-Find-WebLinks is released under [The Unlicense](https://github.com/mukkino/AE-Find-WebLinks/blob/main/LICENSE), with no warranty. It may be used, modified and distributed for personal or commercial purposes under that licence.
 
 For bug reports and feature requests, visit the [project page](https://alterego.cc/wp/ae-find-weblinks/) or the [GitHub repository](https://github.com/mukkino/AE-Find-WebLinks).
+
 ---
 
